@@ -1,0 +1,8 @@
+{
+  // This project does not use Prettier. Formatting is handled by ESLint
+  // (frontend) and ruff (backend). Disable Prettier so the editor does not
+  // reformat files on save.
+  "prettier.enable": false,
+  "editor.formatOnSave": false,
+  "editor.defaultFormatter": null
+}
