@@ -12,7 +12,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to release, without the leading v (e.g. 0.14.3)"
+        description: "Version to release, prefixed (e.g. trevisan-0.14.3)"
         required: true
         type: string
 
@@ -41,26 +41,31 @@ jobs:
         run: |
           set -euo pipefail
 
-          VERSION="${INPUT_VERSION#v}"
+          RELEASE="$INPUT_VERSION"
 
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::'$INPUT_VERSION' is not a X.Y.Z version"
+          if [[ ! "$RELEASE" =~ ^trevisan-[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$INPUT_VERSION' is not a trevisan-X.Y.Z version"
             exit 1
           fi
 
-          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null 2>&1; then
-            echo "::error::tag v$VERSION already exists"
+          # The tag carries the prefix, but pyproject/package.json/Chart.yaml
+          # must hold plain semver or npm, uv and helm reject it.
+          VERSION="${RELEASE#trevisan-}"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$RELEASE" >/dev/null 2>&1; then
+            echo "::error::tag $RELEASE already exists"
             exit 1
           fi
 
           # An abandoned attempt leaves the branch behind (closing a PR does not
           # delete it), and the push would then be rejected after all the work.
-          BRANCH="chore/release-v$VERSION"
+          BRANCH="chore/release-$RELEASE"
           if git ls-remote --exit-code --heads origin "refs/heads/$BRANCH" >/dev/null 2>&1; then
             echo "::error::branch $BRANCH already exists. Delete it first: git push origin --delete $BRANCH"
             exit 1
           fi
 
+          echo "RELEASE=$RELEASE" >> "$GITHUB_ENV"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
           echo "BRANCH=$BRANCH" >> "$GITHUB_ENV"
 
@@ -122,23 +127,23 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -c "$BRANCH"
-          git commit -am "chore: release v$VERSION"
+          git commit -am "chore: release $RELEASE"
           git push -u origin "$BRANCH"
 
           {
-            echo "Version bump for v$VERSION: \`backend/pyproject.toml\`, \`frontend/package.json\`, \`charts/securo/Chart.yaml\`."
+            echo "Version bump for $RELEASE (\`$VERSION\` in the manifests): \`backend/pyproject.toml\`, \`frontend/package.json\`, \`charts/securo/Chart.yaml\`."
             echo
-            echo "After merging, publish the \`v$VERSION\` GitHub release targeting \`main\` to build and push the images."
+            echo "After merging, publish the \`$RELEASE\` GitHub release targeting \`main\` to build and push the images."
           } > /tmp/pr-body.md
 
           PR_URL="$(gh pr create \
             --base main \
             --head "$BRANCH" \
-            --title "chore: release v$VERSION" \
+            --title "chore: release $RELEASE" \
             --body-file /tmp/pr-body.md)"
 
           echo "::notice::$PR_URL"
-          echo "Release PR for v$VERSION: $PR_URL" >> "$GITHUB_STEP_SUMMARY"
+          echo "Release PR for $RELEASE: $PR_URL" >> "$GITHUB_STEP_SUMMARY"
 
           if [ "$HAS_RELEASE_TOKEN" != "true" ]; then
             echo "::warning::No RELEASE_TOKEN secret, so CI did not start on the PR. Close and reopen it to run the required checks."

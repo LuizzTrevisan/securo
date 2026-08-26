@@ -29,13 +29,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Tags are `trevisan-X.Y.Z`, which is not semver, so metadata-action's
+      # type=semver matcher never fires. Strip the prefix ourselves and feed it
+      # in as a raw tag.
+      - name: Resolve image version
+        id: version
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: echo "version=${TAG_NAME#trevisan-}" >> "$GITHUB_OUTPUT"
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE_PREFIX }}/securo-backend
           tags: |
-            type=semver,pattern={{version}}
+            type=raw,value=${{ steps.version.outputs.version }}
             type=raw,value=latest
 
       - name: Set up QEMU
@@ -69,13 +78,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Tags are `trevisan-X.Y.Z`, which is not semver, so metadata-action's
+      # type=semver matcher never fires. Strip the prefix ourselves and feed it
+      # in as a raw tag.
+      - name: Resolve image version
+        id: version
+        env:
+          TAG_NAME: ${{ github.event.release.tag_name }}
+        run: echo "version=${TAG_NAME#trevisan-}" >> "$GITHUB_OUTPUT"
+
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE_PREFIX }}/securo-frontend
           tags: |
-            type=semver,pattern={{version}}
+            type=raw,value=${{ steps.version.outputs.version }}
             type=raw,value=latest
 
       - name: Set up QEMU
@@ -116,9 +134,10 @@ jobs:
 
       - name: Package and Push Helm Chart
         run: |
-          # Strip the 'v' prefix from the release tag if it exists, as helm chart version needs to be semver without v.
+          # Strip the 'trevisan-' prefix from the release tag, as the helm chart
+          # version has to be plain semver.
           VERSION="${{ github.event.release.tag_name }}"
-          VERSION="${VERSION#v}"
+          VERSION="${VERSION#trevisan-}"
 
           echo "Injecting version $VERSION into artifacthub.io/images annotation"
           sed -i "s|ghcr.io/securo-finance/securo-backend:latest|ghcr.io/securo-finance/securo-backend:${VERSION}|g" charts/securo/Chart.yaml
