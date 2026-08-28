@@ -12,6 +12,7 @@ provider and a bank connection in the way.
 
 import logging
 import uuid
+from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -19,10 +20,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.asset import Asset
 from app.models.asset_transaction import AssetTransaction
 from app.providers.base import HoldingData
+from app.services import asset_transaction_service
 
 logger = logging.getLogger(__name__)
 
 _SOURCE = "pluggy"
+
+# `asset_transactions.quantity` is Numeric(18, 6): anything below this is
+# rounding noise, not a missing trade.
+_QUANTITY_TOLERANCE = Decimal("0.000001")
 
 
 async def sync_holding_ledger(
@@ -70,6 +76,12 @@ async def sync_holding_ledger(
     # ledger over time.
     await session.flush()
 
+    if await _should_promote(session, asset, holding):
+        # The ledger accounts for the whole position, so derive it: units,
+        # preço médio, cost basis, purchase date and realized gain all come
+        # from the trades, exactly as they do for a manual holding.
+        await asset_transaction_service.recompute_and_cache(session, asset)
+
 
 async def _existing_by_external_id(
     session: AsyncSession, asset_id: uuid.UUID
@@ -90,3 +102,55 @@ async def _existing_by_external_id(
         for tx in result.scalars().all()
         if tx.external_id
     }
+
+
+async def _should_promote(
+    session: AsyncSession, asset: Asset, holding: HoldingData
+) -> bool:
+    """Is this ledger complete enough to own the position?
+
+    Only when its derived quantity matches the one the provider reports.
+    Brokerages return a moving window of history, so a ledger that covers the
+    last six months of a five-year position would understate the holding —
+    better to keep the provider's numbers and show the trades as history.
+    """
+    if holding.is_withdrawn:
+        # The caller marks a redemption via sell_date; recompute_and_cache
+        # clears that marker whenever derived units are positive, so a
+        # withdrawn holding must never be promoted.
+        return False
+    if holding.quantity is None:
+        # No reference figure (typical of fixed income) — completeness can't
+        # be established, so it isn't claimed.
+        return False
+
+    rows = await _load_ledger(session, asset.id)
+    derived = _derived_units(rows)
+    if derived <= 0:
+        # Trades that net to nothing against a position the provider still
+        # reports means history is missing; promoting would archive a live
+        # holding.
+        return False
+    return abs(derived - holding.quantity) <= _QUANTITY_TOLERANCE
+
+
+def _derived_units(rows: list[AssetTransaction]) -> Decimal:
+    """Net quantity the ledger accounts for, across every source.
+
+    Manual and imported rows count: the question is whether the asset's whole
+    ledger explains the position, not whether this provider's slice does.
+    """
+    units = Decimal("0")
+    for row in rows:
+        quantity = Decimal(str(row.quantity or 0))
+        units += quantity if row.kind == "buy" else -quantity
+    return units
+
+
+async def _load_ledger(
+    session: AsyncSession, asset_id: uuid.UUID
+) -> list[AssetTransaction]:
+    result = await session.execute(
+        select(AssetTransaction).where(AssetTransaction.asset_id == asset_id)
+    )
+    return list(result.scalars().all())
