@@ -56,7 +56,9 @@ async def test_sync_populates_the_ledger_and_derives_the_position(
     )).scalars().all()
 
     assert {r.external_id for r in rows} == {"tx-1", "tx-2"}
-    assert all(r.source == "pluggy" for r in rows)
+    # Rows are tagged with the asset's own source, not a hardcoded provider
+    # name — this test's connection uses provider="test".
+    assert all(r.source == asset.source for r in rows)
     assert asset.units == Decimal("35")
     assert asset.average_price is not None
 

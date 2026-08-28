@@ -237,7 +237,7 @@ def _reject_if_provider_owned(tx: AssetTransaction) -> None:
     overwritten and a delete would simply come back — failing loudly beats
     letting the user's change disappear a few hours later.
     """
-    if tx.source == "pluggy":
+    if tx.source not in ("manual", "import"):
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=(

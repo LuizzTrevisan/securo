@@ -2463,7 +2463,7 @@ function AssetTransactionsTab({
             const cur = tx.currency ?? 'USD'
             // Rows a bank sync owns: the backend refuses edits, so don't
             // offer controls that can only fail.
-            const isSynced = tx.source === 'pluggy'
+            const isSynced = tx.source !== 'manual' && tx.source !== 'import'
             return (
               <div key={tx.id} className="flex items-center gap-3 px-4 py-3 hover:bg-muted/20 transition-colors">
                 <Badge

@@ -1,16 +1,16 @@
 """Ingest provider-reported trades into an asset's ledger.
 
-Pluggy embeds a holding's buy/sell history in its /investments payload. Those
-rows go into `asset_transactions` with source="pluggy" so a synced brokerage
-position gets the same ledger a manual or imported one has — preço médio,
-realized gains, and something to export at tax time.
+Pluggy embeds a holding's buy/sell history in its /investments payload, and
+other providers may do the same. Rows go into `asset_transactions` tagged
+with the asset's own `source` so a synced brokerage position gets the same
+ledger a manual or imported one has — preço médio, realized gains, and
+something to export at tax time.
 
 Kept out of `connection_service` on purpose: that module is already the most
 intricate file in the backend, and this logic is worth testing without a
 provider and a bank connection in the way.
 """
 
-import logging
 import uuid
 from decimal import Decimal
 
@@ -21,10 +21,6 @@ from app.models.asset import Asset
 from app.models.asset_transaction import AssetTransaction
 from app.providers.base import HoldingData
 from app.services import asset_transaction_service
-
-logger = logging.getLogger(__name__)
-
-_SOURCE = "pluggy"
 
 # `asset_transactions.quantity` is Numeric(18, 6): anything below this is
 # rounding noise, not a missing trade.
@@ -43,7 +39,7 @@ async def sync_holding_ledger(
         # The common case by far — no query, no flush.
         return
 
-    existing = await _existing_by_external_id(session, asset.id)
+    existing = await _existing_by_external_id(session, asset)
 
     for row in holding.transactions:
         current = existing.get(row.external_id)
@@ -57,7 +53,7 @@ async def sync_holding_ledger(
                     price=row.price,
                     fee=row.fee,
                     date=row.date,
-                    source=_SOURCE,
+                    source=asset.source,
                     external_id=row.external_id,
                 )
             )
@@ -81,20 +77,30 @@ async def sync_holding_ledger(
         # preço médio, cost basis, purchase date and realized gain all come
         # from the trades, exactly as they do for a manual holding.
         await asset_transaction_service.recompute_and_cache(session, asset)
+    elif asset.sell_date is None:
+        # Non-promotion means the provider's numbers stand, and
+        # average_price/realized_gain are supposed to be the observability
+        # marker for "the ledger is authoritative" — so clear them here.
+        # Skipped when the user has marked the asset sold: that asset may
+        # have been legitimately promoted before the sell_date was set, and
+        # its historical average_price/realized_gain belong to the user's
+        # own record, not to this sync.
+        asset.average_price = None
+        asset.realized_gain = None
 
 
 async def _existing_by_external_id(
-    session: AsyncSession, asset_id: uuid.UUID
+    session: AsyncSession, asset: Asset
 ) -> dict[str, AssetTransaction]:
     """This service's own rows, keyed by provider id.
 
-    Scoped to source="pluggy" so a manual or imported row that happens to
-    carry the same `external_id` is never overwritten.
+    Scoped to this asset's own source so a manual or imported row that
+    happens to carry the same `external_id` is never overwritten.
     """
     result = await session.execute(
         select(AssetTransaction).where(
-            AssetTransaction.asset_id == asset_id,
-            AssetTransaction.source == _SOURCE,
+            AssetTransaction.asset_id == asset.id,
+            AssetTransaction.source == asset.source,
         )
     )
     return {
@@ -114,10 +120,17 @@ async def _should_promote(
     last six months of a five-year position would understate the holding —
     better to keep the provider's numbers and show the trades as history.
     """
+    if asset.sell_date is not None:
+        # Covers both a provider-reported closure and a sell_date the user
+        # set themselves. recompute_and_cache clears sell_date/sell_price
+        # whenever derived units are positive, which would silently re-open
+        # a position the user (or the provider) marked closed.
+        return False
     if holding.is_withdrawn:
-        # The caller marks a redemption via sell_date; recompute_and_cache
-        # clears that marker whenever derived units are positive, so a
-        # withdrawn holding must never be promoted.
+        # Belt and suspenders: the real sync path (_sync_holdings) already
+        # `continue`s past a withdrawn holding before this is ever called,
+        # and it sets sell_date first, which the check above now also
+        # catches. Kept so this function is safe to call directly.
         return False
     if holding.quantity is None:
         # No reference figure (typical of fixed income) — completeness can't

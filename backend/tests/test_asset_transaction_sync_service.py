@@ -249,6 +249,59 @@ async def test_fractional_quantities_within_tolerance_promote(session, synced_as
 
 
 @pytest.mark.asyncio
+async def test_user_set_sell_date_blocks_promotion_and_survives(session, synced_asset):
+    """A user-set sell_date/sell_price must never be silently cleared by a
+    sync — even when the ledger the provider still reports would otherwise
+    be complete enough to promote."""
+    synced_asset.units = Decimal("35")
+    synced_asset.sell_date = date(2026, 8, 1)
+    synced_asset.sell_price = Decimal("9.10")
+    holding = _holding(
+        [
+            _tx("tx-1", quantity="5", price="8.22", fee="0.13", d=date(2026, 7, 27)),
+            _tx("tx-2", quantity="30", price="8.22", fee="0.13", d=date(2026, 7, 27)),
+        ],
+        quantity="35",
+    )
+    await asset_transaction_sync_service.sync_holding_ledger(session, synced_asset, holding)
+
+    assert synced_asset.sell_date == date(2026, 8, 1)
+    assert synced_asset.sell_price == Decimal("9.10")
+    assert synced_asset.average_price is None
+
+
+@pytest.mark.asyncio
+async def test_promoted_asset_that_stops_matching_clears_average_price(session, synced_asset):
+    """Once promoted, average_price is the "ledger is authoritative" marker.
+    If a later sync's payload no longer matches quantity (window aged out,
+    provider restated), that marker must not linger over stale numbers."""
+    synced_asset.units = Decimal("35")
+    holding = _holding(
+        [
+            _tx("tx-1", quantity="5", price="8.22", fee="0.13", d=date(2026, 7, 27)),
+            _tx("tx-2", quantity="30", price="8.22", fee="0.13", d=date(2026, 7, 27)),
+        ],
+        quantity="35",
+    )
+    await asset_transaction_sync_service.sync_holding_ledger(session, synced_asset, holding)
+    assert synced_asset.average_price is not None
+
+    # Provider now reports a larger position than the ledger accounts for.
+    synced_asset.units = Decimal("53")
+    holding2 = _holding(
+        [
+            _tx("tx-1", quantity="5", price="8.22", fee="0.13", d=date(2026, 7, 27)),
+            _tx("tx-2", quantity="30", price="8.22", fee="0.13", d=date(2026, 7, 27)),
+        ],
+        quantity="53",
+    )
+    await asset_transaction_sync_service.sync_holding_ledger(session, synced_asset, holding2)
+
+    assert synced_asset.average_price is None
+    assert synced_asset.realized_gain is None
+
+
+@pytest.mark.asyncio
 async def test_manual_rows_count_toward_completeness(session, synced_asset):
     """The test is over the whole ledger, not just the provider's slice."""
     synced_asset.units = Decimal("15")

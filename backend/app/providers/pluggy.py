@@ -134,11 +134,12 @@ _ISSUE_DATE_IS_PURCHASE_DATE = {"FIXED_INCOME", "COE"}
 # not a trade, and has no place in a buy/sell ledger.
 _TRANSACTION_KINDS = {"BUY": "buy", "SELL": "sell"}
 
-# Every numeric member of Pluggy's `expenses` object. Summing them gives the
-# all-in cost of the trade, which is what belongs in the ledger's `fee` and
-# therefore in the cost basis. Non-numeric members (ids, timestamps) are
-# skipped by name rather than by type so a new fee field Pluggy adds is
-# noticed here instead of silently ignored.
+# Every known fee member of Pluggy's `expenses` object. Summing them gives
+# the all-in cost of the trade, which is what belongs in the ledger's `fee`
+# and therefore in the cost basis. This is an allowlist, not a type filter:
+# a fee field Pluggy adds later is missed until someone adds it here, which
+# beats the alternative of summing some as-yet-unknown numeric field (an id,
+# a timestamp) into the fee by accident.
 _EXPENSE_FIELDS = (
     "serviceTax", "brokerageFee", "incomeTax", "other",
     "tradingAssetsNoticeFee", "maintenanceFee", "settlementFee",
