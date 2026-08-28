@@ -36,6 +36,7 @@ from app.providers.base import (
 )
 from app.services import oauth_state
 from app.services import admin_service
+from app.services import asset_transaction_sync_service
 from app.services import recurring_match_service
 from app.services.account_service import (
     _simplefin_to_internal_balance,
@@ -558,6 +559,10 @@ async def _sync_holdings(
             session, existing, holding, user_id, connection.id, source,
             workspace_id=connection.workspace_id,
         )
+        # Provider-reported trades → the asset's ledger (preço médio, IR
+        # reporting). Runs after the upsert so a promoted ledger writes over
+        # the provider-reported quantity, which is the intended precedence.
+        await asset_transaction_sync_service.sync_holding_ledger(session, asset, holding)
         # Attach to its institution's wallet. NOTE this deliberately moves
         # holdings between sync-owned wallets, not just out of a null group
         # like it used to: re-attribution corrects the sync's own earlier
