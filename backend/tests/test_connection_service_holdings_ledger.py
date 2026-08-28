@@ -4,6 +4,7 @@ Pluggy already returns, and a second sync is idempotent.
 
 from datetime import date
 from decimal import Decimal
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from sqlalchemy import select
@@ -35,27 +36,16 @@ def _holding_with_trades() -> HoldingData:
     )
 
 
-class _FakeProvider:
-    """Only the surface `_sync_holdings` touches."""
-
-    def __init__(self, holdings):
-        self._holdings = holdings
-
-    async def get_holdings(self, credentials):
-        return self._holdings
-
-
 @pytest.mark.asyncio
 async def test_sync_populates_the_ledger_and_derives_the_position(
-    session, test_user, test_connection, monkeypatch
+    session, test_user, test_connection
 ):
-    monkeypatch.setattr(
-        connection_service, "get_provider",
-        lambda name: _FakeProvider([_holding_with_trades()]),
-    )
-    await connection_service._sync_holdings(
-        session, test_user.id, test_connection, {"item_id": "i"}
-    )
+    mock_provider = AsyncMock()
+    mock_provider.get_holdings = AsyncMock(return_value=[_holding_with_trades()])
+    with patch("app.services.connection_service.get_provider", return_value=mock_provider):
+        await connection_service._sync_holdings(
+            session, test_user.id, test_connection, {"item_id": "i"}
+        )
     await session.flush()
 
     asset = (await session.execute(
@@ -73,16 +63,15 @@ async def test_sync_populates_the_ledger_and_derives_the_position(
 
 @pytest.mark.asyncio
 async def test_second_sync_does_not_duplicate_the_ledger(
-    session, test_user, test_connection, monkeypatch
+    session, test_user, test_connection
 ):
-    monkeypatch.setattr(
-        connection_service, "get_provider",
-        lambda name: _FakeProvider([_holding_with_trades()]),
-    )
-    for _ in range(2):
-        await connection_service._sync_holdings(
-            session, test_user.id, test_connection, {"item_id": "i"}
-        )
+    mock_provider = AsyncMock()
+    mock_provider.get_holdings = AsyncMock(return_value=[_holding_with_trades()])
+    with patch("app.services.connection_service.get_provider", return_value=mock_provider):
+        for _ in range(2):
+            await connection_service._sync_holdings(
+                session, test_user.id, test_connection, {"item_id": "i"}
+            )
     await session.flush()
 
     asset = (await session.execute(
