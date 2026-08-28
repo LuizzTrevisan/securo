@@ -16,6 +16,7 @@ from app.providers.base import (
     ConnectionData,
     ConnectTokenData,
     HoldingData,
+    HoldingTransactionData,
     RefreshOutcome,
     TransactionData,
     mask_last4,
@@ -119,7 +120,7 @@ def _date_or_none(value) -> Optional[date]:
 # nested `metadata` for pensions, etc.) without tying our schema to Pluggy.
 _HOLDING_PROMOTED_KEYS = {
     "id", "balance", "currencyCode", "quantity", "value",
-    "amountOriginal", "dueDate", "isin", "issueDate",
+    "amountOriginal", "dueDate", "isin", "issueDate", "transactions",
 }
 
 # Pluggy `type` values where `issueDate` equals the user's purchase date.
@@ -127,6 +128,67 @@ _HOLDING_PROMOTED_KEYS = {
 # — potentially years before the user bought in. Using it as purchase_date
 # would produce badly-wrong evolution charts, so we skip it for those.
 _ISSUE_DATE_IS_PURCHASE_DATE = {"FIXED_INCOME", "COE"}
+
+# Pluggy `type` values that move units in or out of a position. Everything
+# else it reports (INTEREST, TAX, TRANSFER, AMORTIZATION, …) is cash-flow,
+# not a trade, and has no place in a buy/sell ledger.
+_TRANSACTION_KINDS = {"BUY": "buy", "SELL": "sell"}
+
+# Every numeric member of Pluggy's `expenses` object. Summing them gives the
+# all-in cost of the trade, which is what belongs in the ledger's `fee` and
+# therefore in the cost basis. Non-numeric members (ids, timestamps) are
+# skipped by name rather than by type so a new fee field Pluggy adds is
+# noticed here instead of silently ignored.
+_EXPENSE_FIELDS = (
+    "serviceTax", "brokerageFee", "incomeTax", "other",
+    "tradingAssetsNoticeFee", "maintenanceFee", "settlementFee",
+    "clearingFee", "stockExchangeFee", "custodyFee", "operatingFee",
+    "iof", "iofProvision",
+)
+
+
+def _sum_expenses(expenses: Optional[dict]) -> Decimal:
+    """Total the fee breakdown Pluggy attaches to a trade, nulls as zero."""
+    if not expenses:
+        return Decimal("0")
+    total = Decimal("0")
+    for key in _EXPENSE_FIELDS:
+        value = _decimal_or_none(expenses.get(key))
+        if value is not None:
+            total += value
+    return total
+
+
+def _build_holding_transactions(raw: Optional[list]) -> list[HoldingTransactionData]:
+    """Map Pluggy's per-holding `transactions` array to ledger rows.
+
+    Rows are dropped rather than guessed at: a type that isn't a trade, a
+    missing provider id (the dedupe key — without it every sync would insert
+    a duplicate), or a missing quantity/price all mean there is no position
+    change we can represent.
+    """
+    rows: list[HoldingTransactionData] = []
+    for item in raw or []:
+        kind = _TRANSACTION_KINDS.get((item.get("type") or "").upper())
+        external_id = item.get("id")
+        quantity = _decimal_or_none(item.get("quantity"))
+        price = _decimal_or_none(item.get("value"))
+        if kind is None or not external_id or not quantity or price is None:
+            continue
+        trade_date = _date_or_none(item.get("tradeDate")) or _date_or_none(item.get("date"))
+        if trade_date is None:
+            continue
+        rows.append(
+            HoldingTransactionData(
+                external_id=str(external_id),
+                kind=kind,
+                quantity=abs(quantity),
+                price=price,
+                fee=_sum_expenses(item.get("expenses")),
+                date=trade_date,
+            )
+        )
+    return rows
 
 
 def _build_holding_data(inv: dict) -> HoldingData:
@@ -160,6 +222,7 @@ def _build_holding_data(inv: dict) -> HoldingData:
         maturity_date=_date_or_none(inv.get("dueDate")),
         is_withdrawn=pluggy_status == "TOTAL_WITHDRAWAL",
         metadata=metadata or None,
+        transactions=_build_holding_transactions(inv.get("transactions")),
     )
 
 

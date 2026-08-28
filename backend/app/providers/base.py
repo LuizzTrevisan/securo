@@ -138,6 +138,24 @@ class BillData:
 
 
 @dataclass
+class HoldingTransactionData:
+    """One buy or sell in a holding's history, provider-agnostic.
+
+    Providers that report a position's trades (Pluggy embeds them in
+    /investments) emit these so the sync layer can build the asset ledger.
+    `quantity` is always positive — direction lives in `kind` — matching
+    the `asset_transactions` table this ends up in.
+    """
+
+    external_id: str  # the provider's transaction id — the dedupe key
+    kind: str  # "buy" | "sell"
+    quantity: Decimal
+    price: Decimal  # per unit, in the holding's currency
+    fee: Decimal  # total costs; Decimal("0") when the provider reports none
+    date: date  # trade date, not settlement date
+
+
+@dataclass
 class HoldingData:
     """A normalized investment holding, provider-agnostic.
 
@@ -171,6 +189,10 @@ class HoldingData:
     # providers whose holdings aren't attributable to an account.
     account_external_id: Optional[str] = None
     account_name: Optional[str] = None
+    # Trades behind this position, when the provider reports them. Empty for
+    # providers that don't (SimpleFIN, Tesouro Direto) — those holdings keep
+    # provider-reported quantity and no ledger.
+    transactions: list["HoldingTransactionData"] = field(default_factory=list)
 
 
 @dataclass
