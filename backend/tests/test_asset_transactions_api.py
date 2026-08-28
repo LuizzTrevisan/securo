@@ -4,6 +4,7 @@ Exercises the HTTP surface: per-asset CRUD, the workspace-wide list + filters,
 the find-or-create buy endpoint, validation, 404s and auth.
 """
 import uuid
+from datetime import date
 from decimal import Decimal
 
 import pytest
@@ -12,7 +13,9 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.asset import Asset
+from app.models.asset_transaction import AssetTransaction
 from app.models.user import User
+from app.models.workspace import Workspace
 
 
 @pytest_asyncio.fixture
@@ -211,3 +214,59 @@ async def test_oversell_rejected_via_api(client: AsyncClient, auth_headers: dict
 @pytest.mark.asyncio
 async def test_transactions_require_auth(client: AsyncClient):
     assert (await client.get("/api/assets/transactions")).status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_synced_transaction_cannot_be_edited(
+    client, session, auth_headers, test_user: User, test_workspace: Workspace
+):
+    """A synced row is provider-owned: an edit would be silently overwritten
+    by the next sync, so it is refused up front."""
+    asset = Asset(
+        user_id=test_user.id, workspace_id=test_workspace.id, name="MXRF11",
+        type="investment", currency="BRL", source="pluggy", external_id="inv-1",
+        valuation_method="manual",
+    )
+    session.add(asset)
+    await session.flush()
+    tx = AssetTransaction(
+        asset_id=asset.id, workspace_id=test_workspace.id, kind="buy",
+        quantity=Decimal("5"), price=Decimal("8.22"), fee=Decimal("0.13"),
+        date=date(2026, 7, 27), source="pluggy", external_id="tx-1",
+    )
+    session.add(tx)
+    await session.commit()
+
+    response = await client.patch(
+        f"/api/assets/transactions/{tx.id}",
+        json={"price": 9.99},
+        headers=auth_headers,
+    )
+    assert response.status_code == 422
+    assert "sync" in response.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_synced_transaction_cannot_be_deleted(
+    client, session, auth_headers, test_user: User, test_workspace: Workspace
+):
+    """Deleting one would only bring it back on the next sync."""
+    asset = Asset(
+        user_id=test_user.id, workspace_id=test_workspace.id, name="MXRF11",
+        type="investment", currency="BRL", source="pluggy", external_id="inv-1",
+        valuation_method="manual",
+    )
+    session.add(asset)
+    await session.flush()
+    tx = AssetTransaction(
+        asset_id=asset.id, workspace_id=test_workspace.id, kind="buy",
+        quantity=Decimal("5"), price=Decimal("8.22"), fee=Decimal("0.13"),
+        date=date(2026, 7, 27), source="pluggy", external_id="tx-1",
+    )
+    session.add(tx)
+    await session.commit()
+
+    response = await client.delete(
+        f"/api/assets/transactions/{tx.id}", headers=auth_headers
+    )
+    assert response.status_code == 422

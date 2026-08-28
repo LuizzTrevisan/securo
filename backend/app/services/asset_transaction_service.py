@@ -230,6 +230,23 @@ async def list_workspace_transactions(
     return [_tx_to_read(tx, asset) for tx, asset in result.all()]
 
 
+def _reject_if_provider_owned(tx: AssetTransaction) -> None:
+    """Refuse edits to a row a bank sync owns.
+
+    The sync upserts by provider id on every run, so an edit here would be
+    overwritten and a delete would simply come back — failing loudly beats
+    letting the user's change disappear a few hours later.
+    """
+    if tx.source == "pluggy":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "This transaction is managed by a bank sync and can't be "
+                "edited or deleted."
+            ),
+        )
+
+
 def _validate(kind: str, quantity: Decimal, price: Decimal) -> None:
     if kind not in _VALID_KINDS:
         raise HTTPException(
@@ -293,6 +310,7 @@ async def update_transaction(
     tx = result.scalar_one_or_none()
     if tx is None:
         return None
+    _reject_if_provider_owned(tx)
     fields = data.model_dump(exclude_unset=True)
     # Validate the prospective ledger before mutating the row — editing a buy
     # down or a sell up could drive the position negative.
@@ -334,6 +352,7 @@ async def delete_transaction(
     tx = result.scalar_one_or_none()
     if tx is None:
         return None
+    _reject_if_provider_owned(tx)
     asset = await _load_asset(session, tx.asset_id, workspace_id)
     if asset is None:
         return None
