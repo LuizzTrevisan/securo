@@ -192,7 +192,7 @@ def _build_holding_transactions(raw: Optional[list]) -> list[HoldingTransactionD
     return rows
 
 
-def _build_holding_data(inv: dict) -> HoldingData:
+def _build_holding_data(inv: dict, transactions: Optional[list] = None) -> HoldingData:
     """Map a Pluggy investment payload to HoldingData.
 
     `balance` is chosen over `amount` for current value: Pluggy documents
@@ -210,6 +210,8 @@ def _build_holding_data(inv: dict) -> HoldingData:
 
     metadata = {k: v for k, v in inv.items() if k not in _HOLDING_PROMOTED_KEYS}
 
+    tx_source = transactions if transactions is not None else inv.get("transactions")
+
     return HoldingData(
         external_id=str(inv["id"]),
         name=inv.get("name") or "Investment",
@@ -223,7 +225,7 @@ def _build_holding_data(inv: dict) -> HoldingData:
         maturity_date=_date_or_none(inv.get("dueDate")),
         is_withdrawn=pluggy_status == "TOTAL_WITHDRAWAL",
         metadata=metadata or None,
-        transactions=_build_holding_transactions(inv.get("transactions")),
+        transactions=_build_holding_transactions(tx_source),
     )
 
 
@@ -692,6 +694,41 @@ class PluggyProvider(BankProvider):
             )
             return "failed"
 
+    async def _fetch_investment_transactions(
+        self, client: httpx.AsyncClient, headers: dict, investment_id: str
+    ) -> list[dict]:
+        """Fetch transactions for a specific investment from /investments/{id}/transactions."""
+        txns: list[dict] = []
+        page = 1
+        while True:
+            try:
+                resp = await client.get(
+                    f"{PLUGGY_API_BASE}/investments/{investment_id}/transactions",
+                    headers=headers,
+                    params={"pageSize": 500, "page": page},
+                )
+                if resp.status_code == 404:
+                    return []
+                resp.raise_for_status()
+                data = resp.json()
+            except httpx.HTTPError as err:
+                logger.warning(
+                    "Failed to fetch transactions for investment %s: %s",
+                    investment_id,
+                    err,
+                )
+                return []
+
+            results = data.get("results", [])
+            txns.extend(results)
+
+            total_pages = data.get("totalPages", 1)
+            if page >= total_pages or not results:
+                break
+            page += 1
+
+        return txns
+
     async def get_holdings(self, credentials: dict) -> list[HoldingData]:
         """Fetch investment holdings from Pluggy's /investments endpoint.
 
@@ -700,10 +737,12 @@ class PluggyProvider(BankProvider):
         come back with richer fields (quantity, unit price, profit,
         maturity). We normalize to HoldingData; the rest goes into
         `metadata` so downstream code doesn't leak Pluggy specifics.
+        Transactions for each holding are fetched from
+        /investments/{id}/transactions and attached to HoldingData.
         """
         item_id = credentials["item_id"]
         headers = await self._headers()
-        holdings: list[HoldingData] = []
+        raw_investments: list[dict] = []
         page = 1
 
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -717,15 +756,26 @@ class PluggyProvider(BankProvider):
                 data = resp.json()
 
                 results = data.get("results", [])
-                for inv in results:
-                    holdings.append(_build_holding_data(inv))
+                raw_investments.extend(results)
 
                 total_pages = data.get("totalPages", 1)
                 if page >= total_pages or not results:
                     break
                 page += 1
 
-        return holdings
+            async def _fetch_one_holding(inv: dict) -> HoldingData:
+                inv_id = inv.get("id")
+                txns_raw: list[dict] = []
+                if inv_id:
+                    txns_raw = await self._fetch_investment_transactions(
+                        client, headers, str(inv_id)
+                    )
+                return _build_holding_data(inv, transactions=txns_raw)
+
+            holdings = await asyncio.gather(
+                *[_fetch_one_holding(inv) for inv in raw_investments]
+            )
+            return list(holdings)
 
     async def get_bills(self, credentials: dict, account_external_id: str) -> list[BillData]:
         """Fetch credit-card bills from Pluggy /bills.

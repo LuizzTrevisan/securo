@@ -6,8 +6,12 @@ Pure parser tests — no network, no database.
 
 from datetime import date
 from decimal import Decimal
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from app.providers.pluggy import _build_holding_data, _sum_expenses
+import httpx
+import pytest
+
+from app.providers.pluggy import PluggyProvider, _build_holding_data, _sum_expenses
 
 
 def _investment(transactions: list[dict] | None) -> dict:
@@ -147,3 +151,153 @@ def test_transactions_no_longer_duplicated_into_metadata():
          "tradeDate": "2026-07-27T00:00:00.000Z"},
     ]))
     assert "transactions" not in (holding.metadata or {})
+
+
+# ---- Async get_holdings tests fetching from /investments/{id}/transactions ---
+
+
+@pytest.mark.asyncio
+async def test_get_holdings_fetches_transactions_per_investment():
+    """get_holdings calls /investments and then /investments/{id}/transactions."""
+    investments_response = MagicMock()
+    investments_response.raise_for_status = MagicMock()
+    investments_response.json = MagicMock(return_value={
+        "results": [
+            {
+                "id": "inv-1",
+                "name": "MXRF11",
+                "currencyCode": "BRL",
+                "balance": 400.0,
+                "quantity": 53,
+                "value": 7.49,
+                "type": "EQUITY",
+            }
+        ],
+        "totalPages": 1,
+    })
+
+    txns_response = MagicMock()
+    txns_response.status_code = 200
+    txns_response.raise_for_status = MagicMock()
+    txns_response.json = MagicMock(return_value={
+        "results": [
+            {
+                "id": "tx-1",
+                "type": "BUY",
+                "quantity": 53,
+                "value": 7.49,
+                "tradeDate": "2026-07-27T00:00:00.000Z",
+            }
+        ],
+        "totalPages": 1,
+    })
+
+    async def fake_get(url, headers=None, params=None):
+        if url.endswith("/investments"):
+            return investments_response
+        if "/investments/inv-1/transactions" in url:
+            return txns_response
+        raise AssertionError(f"Unexpected url: {url}")
+
+    client = MagicMock()
+    client.get = AsyncMock(side_effect=fake_get)
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=None)
+
+    provider = PluggyProvider()
+    with patch.object(
+        PluggyProvider, "_ensure_api_key", new=AsyncMock(return_value="fake-key")
+    ), patch("app.providers.pluggy.httpx.AsyncClient", return_value=client):
+        holdings = await provider.get_holdings({"item_id": "item-1"})
+
+    assert len(holdings) == 1
+    assert holdings[0].external_id == "inv-1"
+    assert len(holdings[0].transactions) == 1
+    assert holdings[0].transactions[0].external_id == "tx-1"
+    assert holdings[0].transactions[0].quantity == Decimal("53")
+
+
+@pytest.mark.asyncio
+async def test_get_holdings_handles_404_on_transactions_gracefully():
+    """If /investments/{id}/transactions returns 404, holding still loads with empty transactions."""
+    investments_response = MagicMock()
+    investments_response.raise_for_status = MagicMock()
+    investments_response.json = MagicMock(return_value={
+        "results": [
+            {
+                "id": "inv-2",
+                "name": "CDB Prefixado",
+                "currencyCode": "BRL",
+                "balance": 1000.0,
+                "type": "FIXED_INCOME",
+            }
+        ],
+        "totalPages": 1,
+    })
+
+    txns_response = MagicMock()
+    txns_response.status_code = 404
+
+    async def fake_get(url, headers=None, params=None):
+        if url.endswith("/investments"):
+            return investments_response
+        if "/investments/inv-2/transactions" in url:
+            return txns_response
+        raise AssertionError(f"Unexpected url: {url}")
+
+    client = MagicMock()
+    client.get = AsyncMock(side_effect=fake_get)
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=None)
+
+    provider = PluggyProvider()
+    with patch.object(
+        PluggyProvider, "_ensure_api_key", new=AsyncMock(return_value="fake-key")
+    ), patch("app.providers.pluggy.httpx.AsyncClient", return_value=client):
+        holdings = await provider.get_holdings({"item_id": "item-1"})
+
+    assert len(holdings) == 1
+    assert holdings[0].external_id == "inv-2"
+    assert holdings[0].transactions == []
+
+
+@pytest.mark.asyncio
+async def test_get_holdings_handles_http_error_on_transactions_gracefully():
+    """If /investments/{id}/transactions encounters a network or server error, holding still loads."""
+    investments_response = MagicMock()
+    investments_response.raise_for_status = MagicMock()
+    investments_response.json = MagicMock(return_value={
+        "results": [
+            {
+                "id": "inv-3",
+                "name": "Fundo Multimercado",
+                "currencyCode": "BRL",
+                "balance": 500.0,
+                "type": "MUTUAL_FUND",
+            }
+        ],
+        "totalPages": 1,
+    })
+
+    async def fake_get(url, headers=None, params=None):
+        if url.endswith("/investments"):
+            return investments_response
+        if "/investments/inv-3/transactions" in url:
+            raise httpx.ConnectTimeout("timeout")
+        raise AssertionError(f"Unexpected url: {url}")
+
+    client = MagicMock()
+    client.get = AsyncMock(side_effect=fake_get)
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=None)
+
+    provider = PluggyProvider()
+    with patch.object(
+        PluggyProvider, "_ensure_api_key", new=AsyncMock(return_value="fake-key")
+    ), patch("app.providers.pluggy.httpx.AsyncClient", return_value=client):
+        holdings = await provider.get_holdings({"item_id": "item-1"})
+
+    assert len(holdings) == 1
+    assert holdings[0].external_id == "inv-3"
+    assert holdings[0].transactions == []
+
