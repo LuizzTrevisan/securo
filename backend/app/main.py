@@ -47,6 +47,12 @@ from app.core.rate_limit import login_rate_limit, register_rate_limit, password_
 from app.core.redis import close_redis
 from app.schemas.user import UserCreate, UserRead, UserUpdate
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logging.getLogger("app").setLevel(logging.INFO)
+
 logger = logging.getLogger(__name__)
 settings = get_settings()
 

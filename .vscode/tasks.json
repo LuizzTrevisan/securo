@@ -29,7 +29,7 @@
       "options": {
         "cwd": "${workspaceFolder}/backend"
       },
-      "dependsOn": ["Backend: install", "Redis: start"],
+      "dependsOn": ["Redis: start"],
       "presentation": {
         "reveal": "always",
         "panel": "dedicated"
