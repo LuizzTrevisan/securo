@@ -271,20 +271,6 @@ async def test_recurring_projection_respects_end_date(
 
 
 @pytest.mark.asyncio
-@pytest.mark.skip(reason="to_char() is PostgreSQL-specific; tests use SQLite")
-async def test_monthly_trend_numeric_fields(client, auth_headers, test_transactions):
-    """Monthly trend returns numeric values, not strings."""
-    response = await client.get("/api/dashboard/monthly-trend", headers=auth_headers)
-    assert response.status_code == 200
-    data = response.json()
-    assert len(data) > 0
-
-    for item in data:
-        assert isinstance(item["income"], (int, float))
-        assert isinstance(item["expenses"], (int, float))
-
-
-@pytest.mark.asyncio
 async def test_opening_balance_not_counted_as_monthly_income(client, auth_headers):
     """Opening balance transactions must NOT inflate monthly_income on dashboard."""
     # Create a manual account with a 5000 opening balance (this month)
@@ -366,6 +352,11 @@ async def test_pending_and_future_rows_are_current_vs_projected(
 ):
     """Pending and future rows affect the forecast, never a manual current balance."""
     today = date.today()
+    future_date = today + timedelta(days=3)
+
+    # Keep the queried month aligned with the future row at month boundaries.
+    forecast_month = future_date.replace(day=1).isoformat()
+
     acc_resp = await client.post(
         "/api/accounts",
         json={"name": "Forecast split", "type": "checking", "balance": 1000.00, "currency": "BRL"},
@@ -388,7 +379,7 @@ async def test_pending_and_future_rows_are_current_vs_projected(
             "amount": 200.00,
             "currency": "BRL",
             "type": "debit",
-            "date": (today + timedelta(days=3)).isoformat(),
+            "date": future_date.isoformat(),
             "status": "posted",
         },
     ):
@@ -398,7 +389,7 @@ async def test_pending_and_future_rows_are_current_vs_projected(
 
     resp = await client.get(
         "/api/dashboard/summary",
-        params={"month": _current_month_str()},
+        params={"month": forecast_month},
         headers=auth_headers,
     )
     assert resp.status_code == 200

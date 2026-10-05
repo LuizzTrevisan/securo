@@ -373,6 +373,28 @@ def validate_ru_inn(value: str) -> str | None:
         return None
     return "length"
 
+def validate_kz_biniin(value: str) -> str | None:
+    """Validate a Kazakhstani BIN or IIN.
+
+    BIN (legal entities) and IIN (individuals) share the same 12-digit length
+    and the same published checksum scheme, so one validator serves both. The
+    scheme is two-pass: each pass uses a different weight vector, and the
+    weighted sum modulo 11 is the check digit. A result of 10 from either
+    pass means the number was never issued and the code is rejected.
+    """
+    if not value.isdigit():
+        return "invalid"
+    if len(value) != 12:
+        return "length"
+    weights = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    check = _weighted_sum(value[:11], weights) % 11
+    if check == 10:
+        weights2 = [3, 4, 5, 6, 7, 8, 9, 10, 11, 1, 2]
+        check = _weighted_sum(value[:11], weights2) % 11
+        if check == 10:
+            return "check_digit"
+    return None if value[11] == str(check) else "check_digit"
+
 
 def validate_ua_edrpou(value: str) -> str | None:
     """Eight digits. The check rule differs by registration range, so size
@@ -490,6 +512,10 @@ def validate_sg_uen(value: str) -> str | None:
         return None
     return "invalid"
 
+def validate_az_voen(value: str) -> str | None:
+    """Ten digits. Check for a valid 10-digit format without checksum validation."""
+    return _digits_len(value, 10)
+
 
 def validate_cn_uscc(value: str) -> str | None:
     """Eighteen characters from a restricted alphabet: I, O, S, V and Z are
@@ -529,6 +555,7 @@ VALIDATORS: dict[str, Callable[[str], str | None]] = {
     "ro_cui": validate_ro_cui,
     "ch_uid": validate_ch_uid,
     "ru_inn": validate_ru_inn,
+    "kz_biniin": validate_kz_biniin,
     "ua_edrpou": validate_ua_edrpou,
     "ca_bn": validate_ca_bn,
     "au_abn": validate_au_abn,
@@ -541,4 +568,5 @@ VALIDATORS: dict[str, Callable[[str], str | None]] = {
     "in_pan": validate_in_pan,
     "cn_uscc": validate_cn_uscc,
     "sg_uen": validate_sg_uen,
+    "az_voen": validate_az_voen,
 }

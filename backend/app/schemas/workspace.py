@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 from app.models.workspace import WorkspaceKind
 
@@ -16,6 +16,9 @@ class WorkspaceRead(BaseModel):
     is_archived: bool
     default_currency: str
     locale: Optional[str] = None
+    # The workspace's own calendar, or None to follow the application
+    # timezone. See `core.app_clock`.
+    timezone: Optional[str] = None
     # Where the workspace operates fiscally. Never the UI language: see
     # `models.workspace.Workspace.tax_jurisdiction`.
     tax_jurisdiction: Optional[str] = None
@@ -34,8 +37,7 @@ class WorkspaceRead(BaseModel):
     # sees a module the server thinks is off.
     enabled_modules: list[str] = []
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class WorkspaceCreate(BaseModel):
@@ -63,6 +65,9 @@ class WorkspaceUpdate(BaseModel):
     color: Optional[str] = Field(default=None, max_length=7)
     default_currency: Optional[str] = Field(default=None, min_length=3, max_length=3)
     locale: Optional[str] = Field(default=None, max_length=10)
+    # An IANA name to keep this workspace's calendar in, or null to follow
+    # the application timezone again. Validated by the route.
+    timezone: Optional[str] = Field(default=None, max_length=64)
     # Editable, unlike `kind`: a business relocates, and every workspace that
     # existed before jurisdictions did needs a way to say where it files.
     tax_jurisdiction: Optional[str] = Field(default=None, max_length=10)
@@ -76,8 +81,7 @@ class MemberRead(BaseModel):
     role: str
     joined_at: datetime
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class MemberInvite(BaseModel):

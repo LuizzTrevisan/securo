@@ -17,9 +17,6 @@ from mcp_server.auth import CallContext
 from mcp_server.registry import REGISTRY
 
 
-pytestmark = pytest.mark.asyncio
-
-
 @pytest_asyncio.fixture
 async def ctx(test_user) -> CallContext:
     return CallContext(user_id=test_user.id, conversation_id=uuid.uuid4())
@@ -72,6 +69,21 @@ def test_each_tool_has_input_schema():
     for name, spec in REGISTRY.items():
         assert spec.parameters.get("type") == "object", f"{name} schema must be object"
         assert "properties" in spec.parameters
+
+
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "propose_create_recurring_transaction",
+        "propose_update_recurring_transaction",
+    ],
+    ids=["create", "update"],
+)
+def test_recurring_proposal_frequency_schema_includes_new_values(tool_name):
+    advertised = set(
+        REGISTRY[tool_name].parameters["properties"]["frequency"]["enum"]
+    )
+    assert {"biweekly", "semiannual"} <= advertised
 
 
 # --- Read tools (with real seeded data) -----------------------------------
@@ -273,9 +285,27 @@ async def test_list_accounts(session: AsyncSession, ctx: CallContext, test_accou
 async def test_get_account_summary(session: AsyncSession, ctx: CallContext, test_account, test_transactions):
     handler = REGISTRY["get_account_summary"].handler
     result = await handler(session=session, ctx=ctx, account_id=str(test_account.id))
-    # Real service returns a dict with income/expense/etc. We just verify it's not an error.
     assert isinstance(result, dict)
     assert "error" not in result or result.get("error") is None
+    assert set(result) == {
+        "account_id",
+        "current_balance",
+        "opening_balance",
+        "monthly_income",
+        "monthly_expenses",
+        "projected_income",
+        "projected_expenses",
+    }
+    income = float(sum(t.amount for t in test_transactions if t.type == "credit"))
+    expenses = float(sum(t.amount for t in test_transactions if t.type == "debit"))
+    current_balance = float(test_account.balance)
+    assert result["account_id"] == str(test_account.id)
+    assert result["current_balance"] == pytest.approx(current_balance)
+    assert result["opening_balance"] == pytest.approx(current_balance - (income - expenses))
+    assert result["monthly_income"] == pytest.approx(income)
+    assert result["monthly_expenses"] == pytest.approx(expenses)
+    assert result["projected_income"] == pytest.approx(income)
+    assert result["projected_expenses"] == pytest.approx(expenses)
 
 
 async def test_get_account_summary_unknown_account(session: AsyncSession, ctx: CallContext):
@@ -323,18 +353,6 @@ async def test_aggregate_by_category(
     # We have UBER (Transporte) and IFOOD (Alimentação) as expenses.
     labels = {item.get("label") for item in result["items"]}
     assert "Transporte" in labels or "Alimentação" in labels
-
-
-@pytest.mark.skip(reason="aggregate by month uses PostgreSQL to_char, not portable to SQLite test DB")
-async def test_aggregate_by_month(
-    session: AsyncSession, ctx: CallContext, test_transactions
-):
-    handler = REGISTRY["aggregate"].handler
-    result = await handler(session=session, ctx=ctx, metric="count", group_by="month")
-    assert "items" in result
-    for item in result["items"]:
-        if item["bucket"]:
-            assert len(item["bucket"]) == 7 and item["bucket"][4] == "-"
 
 
 async def test_aggregate_unknown_group_by(session: AsyncSession, ctx: CallContext):
@@ -462,6 +480,22 @@ async def test_propose_create_recurring_monthly_requires_day(
         frequency="monthly", account_id=str(test_account.id),
     )
     assert "day_of_month" in r.get("error", "")
+
+
+async def test_propose_create_recurring_semiannual_requires_day(
+    session: AsyncSession, ctx: CallContext, test_account
+):
+    handler = REGISTRY["propose_create_recurring_transaction"].handler
+    result = await handler(
+        session=session,
+        ctx=ctx,
+        description="Insurance",
+        amount=600.0,
+        type="debit",
+        frequency="semiannual",
+        account_id=str(test_account.id),
+    )
+    assert "day_of_month" in result.get("error", "")
 
 
 async def test_propose_create_recurring_monthly_full(

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
-import { ArrowLeftRight, CalendarDays, CircleDot, Clock, EyeClosed, Minus } from 'lucide-react'
+import { ArrowLeftRight, CalendarDays, ChartNoAxesColumn, CircleDot, Clock, EyeClosed, Minus } from 'lucide-react'
 import type { Account, TransactionCalendarDay, TransactionCalendarItem, TransactionCalendarResponse } from '@/types'
 import { Skeleton } from '@/components/ui/skeleton'
 import { AccountIcon } from '@/components/account-icon'
@@ -9,7 +9,8 @@ import { CategoryIcon } from '@/components/category-icon'
 import { ProjectedTransactionBadge } from '@/components/projected-transaction-badge'
 import { getAccountName } from '@/lib/account-utils'
 import { activityChartData, dayActivity, isCalendarItemInteractive } from '@/lib/calendar-activity'
-import { weekdayShortLabels } from '@/lib/date-utils'
+import { todayInTimezone, weekdayShortLabels } from '@/lib/date-utils'
+import { useEffectiveTimezone } from '@/hooks/use-timezone'
 import { cn } from '@/lib/utils'
 import { formatCurrency } from '@/lib/format'
 import { shouldShowPendingBadge } from '@/lib/transaction-status'
@@ -33,10 +34,6 @@ function signedAmount(item: TransactionCalendarItem) {
 
 function displayDayNumber(date: string) {
   return parseLocalDate(date).getDate()
-}
-
-function todayIso() {
-  return new Date().toISOString().split('T')[0]
 }
 
 // A busy day can hold dozens of rows, and only three fit. Showing the biggest movers
@@ -90,6 +87,10 @@ export function TransactionCalendarView({
 }) {
   const [density, setDensity] = useState<CalendarDensity>(readCalendarDensity)
   const [metric, setMetric] = useState<CalendarMetric>(readCalendarMetric)
+  // The server decides which rows are actual and which are projected by its
+  // own idea of today, so the highlighted day has to be the same one.
+  const timeZone = useEffectiveTimezone()
+  const today = todayInTimezone(timeZone)
 
   const accountById = useMemo(() => {
     const map = new Map<string, Account>()
@@ -108,11 +109,10 @@ export function TransactionCalendarView({
   useEffect(() => {
     if (!calendar?.days.length) return
     if (selectedDate && calendar.days.some((day) => day.date === selectedDate)) return
-    const today = todayIso()
     const inCalendarToday = calendar.days.find((day) => day.date === today)
     const firstInMonth = calendar.days.find((day) => day.in_month)
     onSelectedDateChange((inCalendarToday ?? firstInMonth ?? calendar.days[0]).date)
-  }, [calendar, onSelectedDateChange, selectedDate])
+  }, [calendar, onSelectedDateChange, selectedDate, today])
 
   const selectedDay = calendar?.days.find((day) => day.date === selectedDate)
   const weekDays = useMemo(() => weekdayShortLabels(dateLocale), [dateLocale])
@@ -183,7 +183,7 @@ export function TransactionCalendarView({
               key={day.date}
               day={day}
               selected={day.date === selectedDate}
-              today={day.date === todayIso()}
+              today={day.date === today}
               currency={calendar.currency}
               locale={locale}
               mask={mask}
@@ -1245,6 +1245,12 @@ function CalendarItemRow({
           )}
           {item.is_ignored && (
             <EyeClosed className="h-3 w-3 text-gray-500 shrink-0" />
+          )}
+          {item.exclude_from_pnl && !item.is_ignored && (
+            <ChartNoAxesColumn
+              className="h-3 w-3 text-slate-500 shrink-0"
+              aria-label={t('transactions.excludedFromReports')}
+            />
           )}
           {shouldShowPendingBadge(item) && (
             <span

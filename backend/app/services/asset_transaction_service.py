@@ -29,6 +29,7 @@ from app.schemas.asset import (
     AssetTransactionUpdate,
 )
 from app.services import asset_service
+from app.services.asset_group_service import ensure_group_in_workspace
 
 logger = logging.getLogger(__name__)
 
@@ -121,7 +122,7 @@ def _raise_if_oversell(transactions: list[AssetTransaction]) -> None:
         attempted, available = over
         fmt = lambda q: f"{q:.6f}".rstrip("0").rstrip(".")  # noqa: E731
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=(
                 f"Cannot sell {fmt(attempted)} units — only {fmt(available)} held at that date. "
                 "Short positions aren't supported."
@@ -233,17 +234,17 @@ async def list_workspace_transactions(
 def _validate(kind: str, quantity: Decimal, price: Decimal) -> None:
     if kind not in _VALID_KINDS:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="kind must be 'buy' or 'sell'",
         )
     if quantity is None or quantity <= 0:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="quantity must be > 0",
         )
     if price is None or price < 0:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="price must be >= 0",
         )
 
@@ -355,6 +356,7 @@ async def buy_into_holding(
     """Record a buy, consolidating onto the existing ticker holding in the
     chosen wallet (`group_id`) or creating a new market-priced holding."""
     _validate("buy", data.quantity, data.price)
+    await ensure_group_in_workspace(session, data.group_id, workspace_id)
     ticker = data.ticker.upper()
 
     result = await session.execute(
