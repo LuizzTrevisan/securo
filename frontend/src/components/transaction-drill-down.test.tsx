@@ -85,4 +85,32 @@ describe('TransactionDrillDown', () => {
 
     await waitFor(() => expect(onClose).toHaveBeenCalledTimes(1))
   })
+
+  it('totals only the user share of a split expense and asks for posted rows', async () => {
+    const tx = (overrides: Record<string, unknown>) => ({
+      id: 'tx', description: 'Dinner', date: '2026-09-05', type: 'debit', amount: 100,
+      amount_primary: 100, currency: 'USD', status: 'posted', category: null,
+      attachment_count: 0, splits: [], viewer_share: null, is_shared: false, ...overrides,
+    })
+    vi.mocked(transactions.list).mockResolvedValue({
+      items: [
+        // Owner of a 50/50 split keeps their half.
+        tx({ id: 'owned', splits: [{ share_amount: 50 }, { share_amount: 50 }], viewer_share: 50 }),
+        // A member sees only their own share of someone else's expense.
+        tx({ id: 'shared', amount: 80, amount_primary: 80, is_shared: true, viewer_share: 20 }),
+        tx({ id: 'refund', type: 'credit', amount: 10, amount_primary: 10 }),
+      ],
+      total: 3,
+    } as never)
+
+    renderWithProviders(
+      <TransactionDrillDown
+        filter={{ title: 'Food', from: '2026-09-01', to: '2026-09-12', realizedOnly: true, ownShare: true, netTotal: true }}
+        onClose={vi.fn()}
+      />,
+    )
+
+    expect((await screen.findAllByText('-$60.00')).length).toBeGreaterThan(0)
+    expect(transactions.list).toHaveBeenCalledWith(expect.objectContaining({ status: 'posted', to: '2026-09-12' }))
+  })
 })

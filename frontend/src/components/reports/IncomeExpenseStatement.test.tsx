@@ -25,6 +25,8 @@ vi.mock('@/hooks/use-display-locale', () => ({
   useDateLocale: () => 'en-US',
 }))
 
+vi.mock('@/hooks/use-timezone', () => ({ useEffectiveTimezone: () => undefined }))
+
 vi.mock('@/contexts/auth-context', () => ({
   useAuth: () => ({ user: { preferences: { currency_display: 'USD' } } }),
 }))
@@ -172,12 +174,21 @@ describe('IncomeExpenseStatement', () => {
     // The selected month is the rightmost column.
     await user.click(within(living).getAllByRole('button', { name: t('reports.statementViewTransactions') }).at(-1)!)
 
+    // Like the cell, the list stops at today and counts only the user's share.
     const filter = JSON.parse(screen.getByTestId('drill-down').textContent!)
     expect(filter).toMatchObject({
       category_ids: ['food', 'dining'],
       from: '2026-09-01',
-      to: '2026-09-30',
+      to: '2026-09-12',
       realizedOnly: true,
+      ownShare: true,
+    })
+
+    // A past month runs to its last day.
+    await user.click(within(living).getAllByRole('button', { name: t('reports.statementViewTransactions') }).at(-2)!)
+    expect(JSON.parse(screen.getByTestId('drill-down').textContent!)).toMatchObject({
+      from: '2026-08-01',
+      to: '2026-08-31',
     })
   })
 

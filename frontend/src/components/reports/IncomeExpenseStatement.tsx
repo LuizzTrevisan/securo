@@ -14,6 +14,8 @@ import { reports } from '@/lib/api'
 import { extractApiError } from '@/lib/api-errors'
 import { formatCurrency } from '@/lib/format'
 import { monthLabel, monthRange } from '@/lib/month-utils'
+import { todayInTimezone } from '@/lib/date-utils'
+import { useEffectiveTimezone } from '@/hooks/use-timezone'
 import { cn } from '@/lib/utils'
 import { useDisplayLocale } from '@/hooks/use-display-locale'
 import { usePrivacyMode } from '@/hooks/use-privacy-mode'
@@ -200,6 +202,7 @@ export function IncomeExpenseStatement({ accountIds, month, settings }: IncomeEx
       ? t(row.txn_type === 'credit' ? 'reports.statementUncategorizedIncome' : 'reports.statementUncategorizedExpense')
       : (row.label ?? '')
 
+  const today = todayInTimezone(useEffectiveTimezone())
   const openDrillDown = (row: CategoryStatementRow, ym: string) => {
     const { from, to } = monthRange(ym)
     setDrillDown({
@@ -209,8 +212,10 @@ export function IncomeExpenseStatement({ accountIds, month, settings }: IncomeEx
         : { category_ids: row.category_ids }),
       account_ids: accountIds,
       from,
-      to,
+      // The statement stops at the server's today, so the list does too.
+      to: to < today ? to : today,
       realizedOnly: true,
+      ownShare: true,
       netTotal: true,
     })
   }
