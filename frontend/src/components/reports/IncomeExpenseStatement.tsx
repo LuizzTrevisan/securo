@@ -215,7 +215,8 @@ export function IncomeExpenseStatement({ accountIds, month, settings }: IncomeEx
       // The statement stops at the server's today, so the list does too.
       to: to < today ? to : today,
       realizedOnly: true,
-      ownShare: true,
+      // Scoped to some accounts, the statement counts full amounts.
+      ownShare: !accountIds?.length,
       netTotal: true,
     })
   }

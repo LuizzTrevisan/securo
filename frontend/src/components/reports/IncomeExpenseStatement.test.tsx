@@ -192,6 +192,18 @@ describe('IncomeExpenseStatement', () => {
     })
   })
 
+  it('counts full amounts in the drill-down when the statement is scoped to accounts', async () => {
+    const { user } = renderWithProviders(<Statement accountIds={['acct-1']} />)
+    const living = (await screen.findByText('Living')).closest('tr')!
+
+    await user.click(within(living).getAllByRole('button', { name: t('reports.statementViewTransactions') }).at(-1)!)
+
+    expect(JSON.parse(screen.getByTestId('drill-down').textContent!)).toMatchObject({
+      account_ids: ['acct-1'],
+      ownShare: false,
+    })
+  })
+
   it('remembers the chosen number of columns', async () => {
     const { user } = renderWithProviders(<Statement />)
     await screen.findByText('Living')

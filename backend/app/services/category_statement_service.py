@@ -49,6 +49,44 @@ def _sum_values(rows: list[CategoryStatementRow], width: int) -> list[float]:
     return [round(sum(row.values[i] for row in rows), 2) for i in range(width)]
 
 
+async def _member_split_offset_by_category(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    amount_expr,
+    filters: list,
+) -> dict[Optional[uuid.UUID], float]:
+    """Per category, the part of other members' split expenses in this
+    workspace that is not the viewer's share, for the viewer to subtract.
+
+    The share is in the transaction's own currency, so it is scaled into the
+    primary amount by the same ratio as the transaction.
+    """
+    from app.models.group import GroupMember
+    from app.models.transaction_split import TransactionSplit
+
+    viewer_member_ids = select(GroupMember.id).where(
+        GroupMember.linked_user_id == user_id,
+        GroupMember.is_self.is_(False),
+    )
+    share_primary = (
+        TransactionSplit.share_amount * amount_expr / func.nullif(func.abs(Transaction.amount), 0)
+    )
+    result = await session.execute(
+        select(Transaction.category_id, func.sum(amount_expr - func.coalesce(share_primary, 0)))
+        .select_from(TransactionSplit)
+        .join(Transaction, TransactionSplit.transaction_id == Transaction.id)
+        .join(Account, Transaction.account_id == Account.id)
+        .where(
+            *filters,
+            Transaction.type == "debit",
+            Transaction.user_id != user_id,
+            TransactionSplit.group_member_id.in_(viewer_member_ids),
+        )
+        .group_by(Transaction.category_id)
+    )
+    return {cat_id: float(total or 0) for cat_id, total in result.all()}
+
+
 async def get_category_statement(
     session: AsyncSession,
     workspace_id: uuid.UUID,
@@ -61,9 +99,12 @@ async def get_category_statement(
     """Build the statement for ``month`` and the ``months - 1`` months before it.
 
     Posted transactions only, bucketed by the same reporting date as the other
-    reports, and never past today. Split shares follow the budget rules: the
-    owner keeps only their share and the viewer gains the shares other people
-    put on them, both skipped when the report is scoped to some accounts.
+    reports, and never past today. Closed accounts keep their history here,
+    as in the other period reports. A split expense counts only the viewer's
+    share: the owner keeps the amount less the other members' shares, a
+    workspace member in the split keeps their own share, and someone else's
+    split from outside the workspace adds the viewer's share. All of that is
+    skipped when the report is scoped to some accounts.
     """
     filtered = account_ids is not None
     acct_filter = [Transaction.account_id.in_(account_ids)] if filtered else []
@@ -76,7 +117,6 @@ async def get_category_statement(
     month_starts = [_shift_month(selected, -i) for i in range(months)]
     base_filters = [
         Transaction.workspace_id == workspace_id,
-        Account.is_closed == False,
         Transaction.source != "opening_balance",
         Transaction.status == "posted",
         report_date <= today,
@@ -124,10 +164,20 @@ async def get_category_statement(
             for cat_id, offset in own_offset.items():
                 credits, debits = totals.get(cat_id, (0.0, 0.0))
                 totals[cat_id] = (credits, max(0.0, debits - float(offset)))
+            # Another member's split expense in this workspace is already in
+            # the totals at its full amount; keep only the viewer's share.
+            member_offset = await _member_split_offset_by_category(
+                session, user_id, amount_expr,
+                [*base_filters, report_date >= m_start, report_date < m_end],
+            )
+            for cat_id, offset in member_offset.items():
+                credits, debits = totals.get(cat_id, (0.0, 0.0))
+                totals[cat_id] = (credits, max(0.0, debits - offset))
             shared = await viewer_shared_spending_by_category(
                 session, user_id, m_start, m_end,
                 use_effective_date=use_effective_date,
                 primary_currency=primary_currency,
+                exclude_workspace_id=workspace_id,
             )
             for cat_id, share in shared.items():
                 # Shares of someone else's transaction carry that person's

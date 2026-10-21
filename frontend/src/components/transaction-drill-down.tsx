@@ -113,15 +113,16 @@ export function TransactionDrillDown({
       const amount = Number(tx.amount)
       const amountPrimary = tx.amount_primary != null ? Number(tx.amount_primary) : null
       // A split expense counts only the viewer's part, the way the backend
-      // does it: a member keeps their own share, and the owner the amount
-      // less everyone else's shares. Shares are in the row's own currency,
-      // so the primary amount scales by the same ratio.
+      // does it: a member in the split keeps their own share, the owner the
+      // amount less everyone else's shares, and anyone else the full amount.
+      // Shares are in the row's own currency, so the primary amount scales
+      // by the same ratio.
       const splits = tx.splits ?? []
       const share = !filter?.ownShare || tx.type !== 'debit'
         ? null
         : tx.is_shared
           ? Number(tx.viewer_share ?? 0)
-          : splits.length > 0
+          : splits.length > 0 && tx.user_id === user?.id
             ? amount - (splits.reduce((sum, s) => sum + Number(s.share_amount), 0) - Number(tx.viewer_share ?? 0))
             : null
       const ratio = share != null && amount !== 0 ? share / amount : 1
@@ -173,7 +174,7 @@ export function TransactionDrillDown({
 
     items.sort((a, b) => a.date.localeCompare(b.date))
     return items
-  }, [data, projectedTxs, filter])
+  }, [data, projectedTxs, filter, user?.id])
 
   // Close on Escape, unless the key belongs to a dialog opened from the
   // panel (Radix marks the Escape it handled as defaultPrevented).

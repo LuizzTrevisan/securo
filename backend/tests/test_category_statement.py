@@ -7,6 +7,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.account import Account
 from app.models.category_group import CategoryGroup
+from app.models.group import Group, GroupMember
+from app.models.transaction_split import TransactionSplit
+from app.models.user import User
+from app.models.workspace import WorkspaceMember
 from app.models.transaction import Transaction
 from app.services.category_statement_service import (
     _shift_month,
@@ -147,7 +151,7 @@ async def test_statement_skips_rows_without_activity_in_window(
 
 
 @pytest.mark.asyncio
-async def test_statement_respects_account_filter_and_closed_accounts(
+async def test_statement_respects_account_filter_and_keeps_closed_accounts(
     session: AsyncSession, test_user, test_workspace, statement_data
 ):
     food, _, _ = statement_data["categories"]
@@ -163,7 +167,8 @@ async def test_statement_respects_account_filter_and_closed_accounts(
         session, test_workspace.id, test_user.id, date(2025, 2, 1), months=1,
         primary_currency="BRL",
     )
-    assert everything.expenses.rows[0].values == [-320.0]
+    # A closed account keeps its history, as in the other period reports.
+    assert everything.expenses.rows[0].values == [-1319.0]
 
     scoped = await get_category_statement(
         session, test_workspace.id, test_user.id, date(2025, 2, 1), months=1,
@@ -236,3 +241,61 @@ async def test_category_statement_endpoint_validates_params(client, auth_headers
         "/api/reports/category-statement", params=params, headers=auth_headers,
     )
     assert response.status_code == 422
+
+
+async def _workspace_member(session: AsyncSession, workspace_id, email: str) -> User:
+    user = User(
+        id=uuid.uuid4(), email=email, hashed_password="x",
+        is_active=True, is_superuser=False, is_verified=True,
+    )
+    session.add(user)
+    await session.flush()
+    session.add(WorkspaceMember(id=uuid.uuid4(), workspace_id=workspace_id, user_id=user.id, role="member"))
+    await session.commit()
+    return user
+
+
+@pytest.mark.asyncio
+async def test_statement_counts_each_members_share_of_a_split(
+    session: AsyncSession, test_user, test_workspace, test_categories
+):
+    """A 100 expense split 50/50 between its owner and a workspace member
+    reads -50 for both; a member outside the split sees the full amount, and
+    an account filter drops the split rules for everyone."""
+    food = test_categories[0]
+    member = await _workspace_member(session, test_workspace.id, "member@example.com")
+    bystander = await _workspace_member(session, test_workspace.id, "bystander@example.com")
+
+    group = Group(id=uuid.uuid4(), user_id=test_user.id, workspace_id=test_workspace.id, name="Home")
+    session.add(group)
+    await session.flush()
+    me = GroupMember(id=uuid.uuid4(), group_id=group.id, workspace_id=test_workspace.id, name="Me", is_self=True)
+    friend = GroupMember(
+        id=uuid.uuid4(), group_id=group.id, workspace_id=test_workspace.id,
+        name="Member", linked_user_id=member.id,
+    )
+    session.add_all([me, friend])
+    account = await _account(session, test_user.id)
+    tx = _txn(test_user.id, account, "100", date(2025, 2, 10), "debit", food.id)
+    session.add(tx)
+    await session.flush()
+    session.add_all([
+        TransactionSplit(id=uuid.uuid4(), transaction_id=tx.id, workspace_id=test_workspace.id,
+                         group_member_id=me.id, share_amount=Decimal("50")),
+        TransactionSplit(id=uuid.uuid4(), transaction_id=tx.id, workspace_id=test_workspace.id,
+                         group_member_id=friend.id, share_amount=Decimal("50")),
+    ])
+    await session.commit()
+
+    async def food_value(user_id, **kwargs):
+        statement = await get_category_statement(
+            session, test_workspace.id, user_id, date(2025, 2, 1), months=1,
+            primary_currency="BRL", **kwargs,
+        )
+        return statement.expenses.rows[0].values
+
+    assert await food_value(test_user.id) == [-50.0]
+    assert await food_value(member.id) == [-50.0]
+    assert await food_value(bystander.id) == [-100.0]
+    assert await food_value(test_user.id, account_ids=[account.id]) == [-100.0]
+    assert await food_value(member.id, account_ids=[account.id]) == [-100.0]
