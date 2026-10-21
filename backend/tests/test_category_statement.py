@@ -299,3 +299,37 @@ async def test_statement_counts_each_members_share_of_a_split(
     assert await food_value(bystander.id) == [-100.0]
     assert await food_value(test_user.id, account_ids=[account.id]) == [-100.0]
     assert await food_value(member.id, account_ids=[account.id]) == [-100.0]
+
+
+@pytest.mark.asyncio
+async def test_statement_places_rows_by_the_users_share(
+    session: AsyncSession, test_user, test_workspace, test_categories
+):
+    """A 100 refund against a 150 expense of which the user owes 50 nets
+    +50 for the user, so the row belongs in income even though the full
+    amounts net to -50."""
+    food = test_categories[0]
+    group = Group(id=uuid.uuid4(), user_id=test_user.id, workspace_id=test_workspace.id, name="Trip")
+    session.add(group)
+    await session.flush()
+    me = GroupMember(id=uuid.uuid4(), group_id=group.id, workspace_id=test_workspace.id, name="Me", is_self=True)
+    friend = GroupMember(id=uuid.uuid4(), group_id=group.id, workspace_id=test_workspace.id, name="Friend")
+    session.add_all([me, friend])
+    account = await _account(session, test_user.id)
+    expense = _txn(test_user.id, account, "150", date(2025, 2, 10), "debit", food.id)
+    session.add_all([expense, _txn(test_user.id, account, "100", date(2025, 2, 12), "credit", food.id)])
+    await session.flush()
+    session.add_all([
+        TransactionSplit(id=uuid.uuid4(), transaction_id=expense.id, workspace_id=test_workspace.id,
+                         group_member_id=me.id, share_amount=Decimal("50")),
+        TransactionSplit(id=uuid.uuid4(), transaction_id=expense.id, workspace_id=test_workspace.id,
+                         group_member_id=friend.id, share_amount=Decimal("100")),
+    ])
+    await session.commit()
+
+    statement = await get_category_statement(
+        session, test_workspace.id, test_user.id, date(2025, 2, 1), months=1,
+        primary_currency="BRL",
+    )
+    assert [row.values for row in statement.income.rows] == [[50.0]]
+    assert statement.expenses.rows == []

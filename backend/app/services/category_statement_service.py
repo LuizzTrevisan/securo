@@ -188,7 +188,9 @@ async def get_category_statement(
         per_month.append(totals)
 
     # All-time net per category, up to the end of the selected month, decides
-    # which section each row belongs to.
+    # which section each row belongs to. It follows the same split rules as
+    # the monthly values, so a row sits in the section its numbers point to.
+    lifetime_end = _shift_month(selected, 1)
     lifetime_result = await session.execute(
         select(
             Transaction.category_id,
@@ -199,11 +201,35 @@ async def get_category_statement(
         .where(
             *base_filters,
             Transaction.category_id.isnot(None),
-            report_date < _shift_month(selected, 1),
+            report_date < lifetime_end,
         )
         .group_by(Transaction.category_id)
     )
     lifetime_net = {cat_id: float(net or 0) for cat_id, net in lifetime_result.all()}
+    if not filtered:
+        use_effective_date = accounting_mode == "accrual"
+        own_offset = await owner_split_offset_by_category(
+            session, user_id, date.min, lifetime_end,
+            use_effective_date=use_effective_date,
+            primary_currency=primary_currency,
+            workspace_id=workspace_id,
+        )
+        member_offset = await _member_split_offset_by_category(
+            session, user_id, amount_expr, [*base_filters, report_date < lifetime_end],
+        )
+        for offsets in (own_offset, member_offset):
+            for cat_id, offset in offsets.items():
+                if cat_id is not None:
+                    lifetime_net[cat_id] = lifetime_net.get(cat_id, 0.0) + float(offset)
+        shared = await viewer_shared_spending_by_category(
+            session, user_id, date.min, lifetime_end,
+            use_effective_date=use_effective_date,
+            primary_currency=primary_currency,
+            exclude_workspace_id=workspace_id,
+        )
+        for cat_id, share in shared.items():
+            if cat_id in known_ids:
+                lifetime_net[cat_id] = lifetime_net.get(cat_id, 0.0) - float(share)
 
     def category_values(cat_id: uuid.UUID) -> list[float]:
         values = []
