@@ -192,6 +192,29 @@ describe('IncomeExpenseStatement', () => {
     })
   })
 
+  it('lists shares from other workspaces under uncategorized expenses', async () => {
+    api.reports.categoryStatement.mockResolvedValue({
+      ...statement,
+      expenses: {
+        totals: [-50, 0, 0, 0],
+        rows: [row({ key: 'uncategorized', kind: 'uncategorized', label: null, txn_type: 'debit', values: [-50, 0, 0, 0] })],
+      },
+    })
+    const { user } = renderWithProviders(<Statement />)
+    const uncategorized = (await screen.findByText(t('reports.statementUncategorizedExpense'))).closest('tr')!
+
+    await user.click(within(uncategorized).getByRole('button', { name: t('reports.statementViewTransactions') }))
+
+    // The cell counts the user's share of another workspace's expense,
+    // whose category lives there, so the list has to ask for it too.
+    expect(JSON.parse(screen.getByTestId('drill-down').textContent!)).toMatchObject({
+      uncategorized: true,
+      sharedAsUncategorized: true,
+      type: 'debit',
+      ownShare: true,
+    })
+  })
+
   it('counts full amounts in the drill-down when the statement is scoped to accounts', async () => {
     const { user } = renderWithProviders(<Statement accountIds={['acct-1']} />)
     const living = (await screen.findByText('Living')).closest('tr')!

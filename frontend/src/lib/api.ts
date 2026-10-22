@@ -511,6 +511,7 @@ export const transactions = {
     category_ids?: string[]
     payee_id?: string
     uncategorized?: boolean
+    shared_as_uncategorized?: boolean
     type?: string
     status?: string
     from?: string

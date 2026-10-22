@@ -208,7 +208,7 @@ export function IncomeExpenseStatement({ accountIds, month, settings }: IncomeEx
     setDrillDown({
       title: `${rowLabel(row)} · ${capitalize(monthLabel(ym, dateLocale))}`,
       ...(row.kind === 'uncategorized'
-        ? { uncategorized: true, type: row.txn_type ?? undefined }
+        ? { uncategorized: true, sharedAsUncategorized: true, type: row.txn_type ?? undefined }
         : { category_ids: row.category_ids }),
       account_ids: accountIds,
       from,

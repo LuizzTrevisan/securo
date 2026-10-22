@@ -20,6 +20,10 @@ export type DrillDownFilter = {
   // Any of several categories (e.g. every category of a group).
   category_ids?: string[]
   uncategorized?: boolean
+  // With `uncategorized`, also list the viewer's shares of expenses from
+  // other workspaces: their categories live there, so reports count them
+  // as uncategorized here.
+  sharedAsUncategorized?: boolean
   account_id?: string
   // Scope to a set of accounts (e.g. the active collection's accounts).
   account_ids?: string[]
@@ -77,6 +81,7 @@ export function TransactionDrillDown({
         category_id: filter?.category_id,
         category_ids: filter?.category_ids,
         uncategorized: filter?.uncategorized,
+        shared_as_uncategorized: filter?.sharedAsUncategorized,
         account_id: filter?.account_id,
         account_ids: filter?.account_ids,
         type: filter?.type,

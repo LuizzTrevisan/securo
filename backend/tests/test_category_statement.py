@@ -6,6 +6,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.account import Account
+from app.models.category import Category
 from app.models.category_group import CategoryGroup
 from app.models.group import Group, GroupMember
 from app.models.transaction_split import TransactionSplit
@@ -16,6 +17,7 @@ from app.services.category_statement_service import (
     _shift_month,
     get_category_statement,
 )
+from app.services.workspace_service import create_workspace
 
 
 def test_shift_month_crosses_year_boundaries():
@@ -333,3 +335,74 @@ async def test_statement_places_rows_by_the_users_share(
     )
     assert [row.values for row in statement.income.rows] == [[50.0]]
     assert statement.expenses.rows == []
+
+
+@pytest.mark.asyncio
+async def test_uncategorized_drill_down_lists_shares_from_other_workspaces(
+    session: AsyncSession, client, auth_headers, test_user, test_workspace
+):
+    """Someone else's 100 expense in their own workspace, split 50 with the
+    user, carries a category of that workspace. The statement counts the
+    user's 50 as uncategorized, and the uncategorized drill-down lists the
+    row so the panel adds up to the cell."""
+    owner = User(
+        id=uuid.uuid4(), email="owner@example.com", hashed_password="x",
+        is_active=True, is_superuser=False, is_verified=True,
+    )
+    session.add(owner)
+    await session.flush()
+    other_ws = await create_workspace(
+        session, name="Owner's", creator=owner, self_membership=True, seed_defaults=False,
+    )
+    dining = Category(id=uuid.uuid4(), user_id=owner.id, workspace_id=other_ws.id, name="Dining")
+    account = Account(
+        id=uuid.uuid4(), user_id=owner.id, workspace_id=other_ws.id, name="Owner's",
+        type="checking", balance=Decimal("0"), currency="BRL",
+    )
+    group = Group(id=uuid.uuid4(), user_id=owner.id, workspace_id=other_ws.id, name="Dinners")
+    session.add_all([dining, account, group])
+    await session.flush()
+    owner_member = GroupMember(
+        id=uuid.uuid4(), group_id=group.id, workspace_id=other_ws.id, name="Owner", is_self=True,
+    )
+    user_member = GroupMember(
+        id=uuid.uuid4(), group_id=group.id, workspace_id=other_ws.id,
+        name="Friend", linked_user_id=test_user.id,
+    )
+    session.add_all([owner_member, user_member])
+    tx = _txn(owner.id, account, "100", date(2025, 2, 10), "debit", dining.id, workspace_id=other_ws.id)
+    session.add(tx)
+    await session.flush()
+    session.add_all([
+        TransactionSplit(id=uuid.uuid4(), transaction_id=tx.id, workspace_id=other_ws.id,
+                         group_member_id=owner_member.id, share_amount=Decimal("50")),
+        TransactionSplit(id=uuid.uuid4(), transaction_id=tx.id, workspace_id=other_ws.id,
+                         group_member_id=user_member.id, share_amount=Decimal("50")),
+    ])
+    await session.commit()
+
+    statement = await get_category_statement(
+        session, test_workspace.id, test_user.id, date(2025, 2, 1), months=1,
+        primary_currency="BRL",
+    )
+    [row] = statement.expenses.rows
+    assert (row.kind, row.values) == ("uncategorized", [-50.0])
+
+    params = {
+        "uncategorized": "true", "type": "debit", "status": "posted", "user_pnl_only": "true",
+        "from": "2025-02-01", "to": "2025-02-28",
+    }
+    resp = await client.get(
+        "/api/transactions", headers=auth_headers,
+        params={**params, "shared_as_uncategorized": "true"},
+    )
+    assert resp.status_code == 200
+    [item] = resp.json()["items"]
+    assert item["id"] == str(tx.id)
+    assert item["is_shared"] is True
+    assert float(item["viewer_share"]) == 50.0
+
+    # The plain uncategorized filter, used to categorize rows, keeps
+    # leaving it out: the user can't recategorize someone else's row.
+    resp = await client.get("/api/transactions", headers=auth_headers, params=params)
+    assert resp.json()["items"] == []
