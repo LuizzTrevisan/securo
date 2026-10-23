@@ -3,12 +3,13 @@ from datetime import date as _Date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import case, delete, func, select, or_, update
+from sqlalchemy import ColumnElement, Select, case, delete, func, select, or_, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import contains_eager
 
 from app.core.app_clock import app_today
 from app.models.account import Account
+from app.models.asset import LOAN_COLLATERAL_TYPES, Asset
 from app.models.bank_connection import BankConnection
 from app.models.credit_card_bill import CreditCardBill
 from app.models.transaction import Transaction
@@ -20,8 +21,11 @@ from app.services._query_filters import (
     is_confirmed,
     is_inside_provider_snapshot,
     is_not_future,
+    is_not_ignored,
+    reporting_date_col,
 )
 from app.services.credit_card_service import apply_effective_date, compute_available_credit, get_cycle_dates
+from app.services.fx_rate_service import _resolve_rate
 from app.models.category import Category
 
 
@@ -46,7 +50,8 @@ def _simplefin_to_internal_balance(provider: str, account_type: str, balance: De
 
 def _opening_balance_values(account_type: str, balance: Decimal) -> tuple[Decimal, str]:
     amount = abs(balance)
-    is_credit = (balance > 0) == (account_type != "credit_card")
+    # A loan is entered as the amount owed, like a card, and is debt in the ledger.
+    is_credit = (balance > 0) == (account_type not in {"credit_card", "loan"})
     return amount, "credit" if is_credit else "debit"
 
 
@@ -149,6 +154,16 @@ def _accounts_with_balances_query(
             func.coalesce(balance_sq.c.current_balance, 0).label("current_balance"),
             func.coalesce(prev_balance_sq.c.previous_balance, 0).label("previous_balance"),
             func.coalesce(future_charges_sq.c.future_charges, 0).label("future_charges"),
+            # The opening balance's date, so the edit form can show it and
+            # leave it alone (issue #1204).
+            select(func.min(Transaction.date))
+            .where(
+                Transaction.account_id == Account.id,
+                Transaction.source == "opening_balance",
+            )
+            .correlate(Account)
+            .scalar_subquery()
+            .label("balance_date"),
         )
         .outerjoin(BankConnection)
         .outerjoin(balance_sq, Account.id == balance_sq.c.account_id)
@@ -171,9 +186,21 @@ async def get_accounts(session: AsyncSession, workspace_id: uuid.UUID, include_c
     result = await session.execute(query)
     return [
             serialize_account(
-                acc, current_balance, previous_balance, connection, future_charges=future_charges
+                acc,
+                current_balance,
+                previous_balance,
+                connection,
+                future_charges=future_charges,
+                balance_date=balance_date,
             )
-            for acc, connection, current_balance, previous_balance, future_charges in result.all()
+            for (
+                acc,
+                connection,
+                current_balance,
+                previous_balance,
+                future_charges,
+                balance_date,
+            ) in result.all()
         ]
 
 
@@ -187,9 +214,14 @@ async def get_account_with_balances(
     row = (await session.execute(query)).first()
     if row is None:
         return None
-    acc, connection, current_balance, previous_balance, future_charges = row
+    acc, connection, current_balance, previous_balance, future_charges, balance_date = row
     return serialize_account(
-        acc, current_balance, previous_balance, connection, future_charges=future_charges
+        acc,
+        current_balance,
+        previous_balance,
+        connection,
+        future_charges=future_charges,
+        balance_date=balance_date,
     )
 
 
@@ -222,6 +254,7 @@ def serialize_account(
     connection: Optional[BankConnection] = None,
     *,
     future_charges: Optional[Decimal] = None,
+    balance_date: Optional[_Date] = None,
 ) -> dict:
     # Connected CC: provider stores positive for debt → negate.
     # Manual accounts: transaction math already gives correct sign.
@@ -240,6 +273,7 @@ def serialize_account(
         "display_name": acc.display_name,
         "masked_number": acc.masked_number,
         "type": acc.type,
+        "secured_asset_id": acc.secured_asset_id,
         "balance": acc.balance,
         "currency": acc.currency,
         "current_balance": resolved_balance,
@@ -255,6 +289,7 @@ def serialize_account(
         "shared_balance_group": acc.shared_balance_group,
         "institution_name": institution_name,
         "institution_logo_url": institution_logo_url,
+        "balance_date": balance_date,
         "available_credit": None,
         "next_close_date": None,
         "next_due_date": None,
@@ -326,6 +361,7 @@ async def create_account(
     user_id: uuid.UUID,
     data: AccountCreate,
 ) -> Account:
+    await _validate_secured_asset(session, workspace_id, data.type, data.secured_asset_id)
     is_cc = data.type == "credit_card"
     account = Account(
         user_id=user_id,
@@ -334,6 +370,7 @@ async def create_account(
         type=data.type,
         balance=data.balance,
         currency=data.currency,
+        secured_asset_id=data.secured_asset_id,
         credit_limit=data.credit_limit if is_cc else None,
         statement_close_day=data.statement_close_day if is_cc else None,
         payment_due_day=data.payment_due_day if is_cc else None,
@@ -374,6 +411,33 @@ async def update_account(
 
     update_data = data.model_dump(exclude_unset=True)
     balance_date = update_data.pop("balance_date", None)
+    new_type = update_data.get("type", account.type)
+    if account.connection_id is not None and new_type == "loan":
+        raise ValueError("Bank-connected accounts cannot be loans yet")
+    # Switching between a loan and any other type flips what the balance means
+    # (money held vs. money owed). That is safe for an account that only has
+    # its opening balance; with real history it would silently reinterpret it.
+    if new_type != account.type and "loan" in {account.type, new_type}:
+        has_history = await session.scalar(
+            select(Transaction.id)
+            .where(
+                Transaction.account_id == account.id,
+                Transaction.source != "opening_balance",
+            )
+            .limit(1)
+        )
+        if has_history is not None:
+            raise ValueError("An account with transactions cannot switch to or from a loan")
+    # The property link is dropped when the account stops being a loan, so only
+    # a link sent with this edit is checked.
+    await _validate_secured_asset(
+        session,
+        workspace_id,
+        new_type,
+        update_data.get(
+            "secured_asset_id", account.secured_asset_id if new_type == "loan" else None
+        ),
+    )
 
     # Track whether we need to recompute effective_date for all transactions.
     # Changes to the CC cycle days shift which bill each historical purchase
@@ -381,6 +445,7 @@ async def update_account(
     cycle_fields_changed = any(
         k in update_data for k in ("statement_close_day", "payment_due_day")
     )
+    old_type = account.type
 
     # Bank-connected accounts are managed by the sync pipeline. Beyond display
     # name and credit card metadata (limit + cycle days, which providers often
@@ -452,7 +517,10 @@ async def update_account(
         account.minimum_payment = None
         account.card_brand = None
         account.card_level = None
+    if account.type != "loan":
+        account.secured_asset_id = None
 
+    opening_balance_type_changed = old_type != account.type and "loan" in {old_type, account.type}
     # When balance changes, sync the opening_balance transaction
     if "balance" in update_data:
         new_balance = update_data["balance"]
@@ -488,7 +556,7 @@ async def update_account(
                 session.add(opening_tx)
         elif opening_tx:
             await session.delete(opening_tx)
-    elif balance_date:
+    elif opening_balance_type_changed or balance_date:
         existing_opening = await session.execute(
             select(Transaction).where(
                 Transaction.account_id == account_id,
@@ -497,7 +565,10 @@ async def update_account(
         )
         opening_tx = existing_opening.scalar_one_or_none()
         if opening_tx:
-            opening_tx.date = balance_date
+            if opening_balance_type_changed and account.balance != Decimal("0.00"):
+                _, opening_tx.type = _opening_balance_values(account.type, account.balance)
+            if balance_date:
+                opening_tx.date = balance_date
             apply_effective_date(opening_tx, account)
 
     if cycle_fields_changed:
@@ -506,6 +577,23 @@ async def update_account(
     await session.commit()
     await session.refresh(account)
     return account
+
+
+async def _validate_secured_asset(
+    session: AsyncSession,
+    workspace_id: uuid.UUID,
+    account_type: str,
+    asset_id: Optional[uuid.UUID],
+) -> None:
+    if asset_id is None:
+        return
+    if account_type != "loan":
+        raise ValueError("Only loan accounts can be linked to a property")
+    asset = await session.scalar(
+        select(Asset).where(Asset.id == asset_id, Asset.workspace_id == workspace_id)
+    )
+    if asset is None or asset.type not in LOAN_COLLATERAL_TYPES:
+        raise ValueError("Linked asset must be a property or vehicle in the same workspace")
 
 
 async def _recompute_effective_dates(session: AsyncSession, account: Account) -> None:
@@ -961,89 +1049,11 @@ async def get_account_summary(
         )
     forecast_expenses = float(forecast_expense_result.scalar() or 0)
 
-    # Opening balance: the projected balance at (date_from - 1 day). It seeds
-    # the account-detail running-balance walk, so it includes pending rows and
-    # future-dated rows that occur before the visible window. The opening row
-    # itself is included when it falls inside the window and applied by the
-    # same walk as every other transaction.
-    if account.type != "credit_card" and date_from:
-        ob_base_filters = [
-            Transaction.account_id == account_id,
-            Transaction.is_ignored == False,
-            or_(
-                Transaction.category_id.is_(None),
-                Transaction.category_id.not_in(
-                    select(Category.id).where(Category.is_ignored == True)
-                ),
-            ),
-        ]
-        if account.connection_id:
-            # Connected current balance is the provider snapshot. Reconstruct
-            # the balance before the visible window from that snapshot and all
-            # settled/pending rows in the visible historical portion. This
-            # preserves the provider number even when it includes pending rows.
-            # A recurring placeholder is left out of that unwinding: we
-            # generated it ourselves so it was never in the snapshot, and
-            # removing it here would cancel it out when the walk re-applies it.
-            period_filters = [
-                *ob_base_filters,
-                Transaction.date >= date_from,
-                Transaction.date <= today,
-            ]
-            posted_result = await session.execute(
-                select(func.coalesce(func.sum(
-                    case(
-                        (Transaction.type == "credit", effective_amount),
-                        else_=-effective_amount,
-                    )
-                ), 0)).where(*period_filters, Transaction.status == "posted")
-            )
-            pending_result = await session.execute(
-                select(func.coalesce(func.sum(
-                    case(
-                        (Transaction.type == "credit", effective_amount),
-                        else_=-effective_amount,
-                    )
-                ), 0)).where(
-                    *period_filters,
-                    Transaction.status == "pending",
-                    is_inside_provider_snapshot(),
-                )
-            )
-            opening_balance = current_balance - float(posted_result.scalar() or 0)
-            opening_balance -= float(pending_result.scalar() or 0)
-
-            if date_from > today:
-                before_window_result = await session.execute(
-                    select(func.coalesce(func.sum(
-                        case(
-                            (Transaction.type == "credit", effective_amount),
-                            else_=-effective_amount,
-                        )
-                    ), 0)).where(
-                        *ob_base_filters,
-                        Transaction.date > today,
-                        Transaction.date < date_from,
-                        Transaction.status.in_(("posted", "pending")),
-                    )
-                )
-                opening_balance += float(before_window_result.scalar() or 0)
-        else:
-            manual_result = await session.execute(
-                select(func.coalesce(func.sum(
-                    case(
-                        (Transaction.type == "credit", effective_amount),
-                        else_=-effective_amount,
-                    )
-                ), 0)).where(
-                    *ob_base_filters,
-                    Transaction.date < date_from,
-                    Transaction.status.in_(("posted", "pending")),
-                )
-            )
-            opening_balance = float(manual_result.scalar() or 0)
-    else:
-        opening_balance = 0.0
+    opening_balance = (
+        await get_period_opening_balance(session, account, date_from)
+        if account.type != "credit_card"
+        else 0.0
+    )
 
     return {
         "account_id": account_id,
@@ -1054,6 +1064,102 @@ async def get_account_summary(
         "projected_income": monthly_income + forecast_income,
         "projected_expenses": monthly_expenses + forecast_expenses,
     }
+
+
+async def get_period_opening_balance(
+    session: AsyncSession, account: Account, date_from: _Date,
+) -> float:
+    """Projected balance of a non-credit-card account at (date_from - 1 day).
+
+    It seeds the account-detail running-balance walk, so it includes pending
+    rows and future-dated rows that occur before the visible window. The
+    opening row itself is included when it falls inside the window and applied
+    by the same walk as every other transaction. Shared by the summary, the
+    list's `running_balance` and the running-balance series so all three start
+    from the same number (#1202).
+    """
+    today = app_today()
+    # Use amount_primary only when tx currency differs from account currency
+    effective_amount = case(
+        (Transaction.currency == account.currency, Transaction.amount),
+        else_=func.coalesce(Transaction.amount_primary, Transaction.amount),
+    )
+    ob_base_filters = [
+        Transaction.account_id == account.id,
+        Transaction.is_ignored == False,
+        or_(
+            Transaction.category_id.is_(None),
+            Transaction.category_id.not_in(
+                select(Category.id).where(Category.is_ignored == True)
+            ),
+        ),
+    ]
+    if account.connection_id:
+        # Connected current balance is the provider snapshot. Reconstruct
+        # the balance before the visible window from that snapshot and all
+        # settled/pending rows in the visible historical portion. This
+        # preserves the provider number even when it includes pending rows.
+        # A recurring placeholder is left out of that unwinding: we
+        # generated it ourselves so it was never in the snapshot, and
+        # removing it here would cancel it out when the walk re-applies it.
+        period_filters = [
+            *ob_base_filters,
+            Transaction.date >= date_from,
+            Transaction.date <= today,
+        ]
+        posted_result = await session.execute(
+            select(func.coalesce(func.sum(
+                case(
+                    (Transaction.type == "credit", effective_amount),
+                    else_=-effective_amount,
+                )
+            ), 0)).where(*period_filters, Transaction.status == "posted")
+        )
+        pending_result = await session.execute(
+            select(func.coalesce(func.sum(
+                case(
+                    (Transaction.type == "credit", effective_amount),
+                    else_=-effective_amount,
+                )
+            ), 0)).where(
+                *period_filters,
+                Transaction.status == "pending",
+                is_inside_provider_snapshot(),
+            )
+        )
+        opening_balance = float(account.balance) - float(posted_result.scalar() or 0)
+        opening_balance -= float(pending_result.scalar() or 0)
+
+        if date_from > today:
+            before_window_result = await session.execute(
+                select(func.coalesce(func.sum(
+                    case(
+                        (Transaction.type == "credit", effective_amount),
+                        else_=-effective_amount,
+                    )
+                ), 0)).where(
+                    *ob_base_filters,
+                    Transaction.date > today,
+                    Transaction.date < date_from,
+                    Transaction.status.in_(("posted", "pending")),
+                )
+            )
+            opening_balance += float(before_window_result.scalar() or 0)
+        return opening_balance
+
+    manual_result = await session.execute(
+        select(func.coalesce(func.sum(
+            case(
+                (Transaction.type == "credit", effective_amount),
+                else_=-effective_amount,
+            )
+        ), 0)).where(
+            *ob_base_filters,
+            Transaction.date < date_from,
+            Transaction.status.in_(("posted", "pending")),
+        )
+    )
+    return float(manual_result.scalar() or 0)
 
 
 def _signed_amount_expr(account_currency: str):
@@ -1160,4 +1266,148 @@ async def get_account_balance_history(
         for point in series:
             point["balance"] = round(point["balance"] * sign, 2)
 
+    return series
+
+
+def _running_balance_delta(account_currency: str):
+    """A row's effect on the account-detail running balance (#1202).
+
+    Shared by the transaction list and the daily series so a row moves both by
+    the same amount. Ignored rows, by flag or by category, stay listed but move
+    nothing, as in `get_period_opening_balance`. Status and date are not
+    looked at: the walk is a projection, so pending and future-dated rows count.
+    """
+    return case((is_not_ignored(), _signed_amount_expr(account_currency)), else_=0)
+
+
+def _running_balance_delta_primary(primary_currency: str):
+    """`_running_balance_delta` in the user's primary currency.
+
+    A foreign row with no FX stamp moves nothing rather than being counted
+    1:1, the same call the account page made when it walked the rows itself.
+    """
+    amount = case(
+        (Transaction.amount_primary.is_not(None), Transaction.amount_primary),
+        (Transaction.currency == primary_currency, Transaction.amount),
+        else_=0,
+    )
+    signed = case((Transaction.type == "credit", amount), else_=-amount)
+    return case((is_not_ignored(), signed), else_=0)
+
+
+async def _running_balance_seed(
+    session: AsyncSession, account: Account, date_from: _Date, primary_currency: str,
+) -> tuple[Decimal, Optional[Decimal]]:
+    """Opening balance, and its primary-currency value when the account is in
+    another currency, converted like the summary's `opening_balance_primary`:
+    with a real rate only, and left unset without one (#1165)."""
+    opening = Decimal(str(await get_period_opening_balance(session, account, date_from)))
+    if account.currency == primary_currency:
+        return opening, None
+    rate = await _resolve_rate(session, account.currency, primary_currency)
+    if rate is None:
+        return opening, None
+    return opening, (opening * rate).quantize(Decimal("0.01"))
+
+
+async def get_running_balances(
+    session: AsyncSession, account: Account, filtered_ids: Select, order_col: ColumnElement,
+    date_from: _Date, row_ids: list[uuid.UUID], primary_currency: str,
+) -> dict[uuid.UUID, tuple[float, Optional[float]]]:
+    """Balance right after each of `row_ids`, walking the whole filtered list.
+
+    `filtered_ids` selects the ids of every row the list matched, not just the
+    page, so a row's value does not depend on which page it was loaded on
+    (#1202). The window orders by the exact reverse of the list's default
+    order, so the newest row carries the balance at the end of the range.
+    """
+    opening, opening_primary = await _running_balance_seed(
+        session, account, date_from, primary_currency,
+    )
+    order_by = (order_col.asc(), Transaction.created_at.asc(), Transaction.id.asc())
+    columns = [
+        Transaction.id,
+        func.sum(_running_balance_delta(account.currency))
+        .over(order_by=order_by, rows=(None, 0))
+        .label("walk"),
+    ]
+    if opening_primary is not None:
+        columns.append(
+            func.sum(_running_balance_delta_primary(primary_currency))
+            .over(order_by=order_by, rows=(None, 0))
+            .label("walk_primary")
+        )
+    walk = select(*columns).where(Transaction.id.in_(filtered_ids)).subquery()
+    result = await session.execute(select(walk).where(walk.c.id.in_(row_ids)))
+
+    balances: dict[uuid.UUID, tuple[float, Optional[float]]] = {}
+    for row in result.mappings():
+        balance = float(opening + Decimal(str(row["walk"] or 0)))
+        balance_primary = (
+            float(opening_primary + Decimal(str(row["walk_primary"] or 0)))
+            if opening_primary is not None
+            else None
+        )
+        balances[row["id"]] = (balance, balance_primary)
+    return balances
+
+
+async def get_account_running_balance(
+    session: AsyncSession, account_id: uuid.UUID, workspace_id: uuid.UUID,
+    primary_currency: str, date_from: _Date, date_to: _Date,
+    accounting_mode: Optional[str] = None,
+) -> Optional[list[dict]]:
+    """End-of-day balance for every day in [date_from, date_to] (#1202).
+
+    The same walk as the list's `running_balance` over the unfiltered account
+    list for that range, opening row included, so the last point equals the
+    newest row's value. Unlike `get_account_balance_history`, pending and
+    future-dated rows count: this is the account page's projected balance.
+    """
+    account = await get_account(session, account_id, workspace_id)
+    if not account:
+        return None
+    # A card's page walks its bill cycle client-side; its balance is the debt.
+    if account.type == "credit_card":
+        raise ValueError("Running balance is not available for credit card accounts")
+
+    opening, opening_primary = await _running_balance_seed(
+        session, account, date_from, primary_currency,
+    )
+    # Bucket by the list's date column so each row lands on the day it is
+    # listed under.
+    date_col = reporting_date_col(accounting_mode or "cash")
+    result = await session.execute(
+        select(
+            date_col,
+            func.sum(_running_balance_delta(account.currency)),
+            func.sum(_running_balance_delta_primary(primary_currency)),
+        )
+        .where(
+            Transaction.account_id == account.id,
+            Transaction.workspace_id == workspace_id,
+            date_col >= date_from,
+            date_col <= date_to,
+        )
+        .group_by(date_col)
+    )
+    deltas = {
+        day: (Decimal(str(delta or 0)), Decimal(str(delta_primary or 0)))
+        for day, delta, delta_primary in result.all()
+    }
+
+    series = []
+    balance, balance_primary = opening, opening_primary
+    current = date_from
+    while current <= date_to:
+        delta, delta_primary = deltas.get(current, (Decimal(0), Decimal(0)))
+        balance += delta
+        if balance_primary is not None:
+            balance_primary += delta_primary
+        series.append({
+            "date": current,
+            "balance": float(balance),
+            "balance_primary": float(balance_primary) if balance_primary is not None else None,
+        })
+        current += timedelta(days=1)
     return series

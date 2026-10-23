@@ -673,3 +673,105 @@ async def test_lookup_bank_info_disabled_by_default_skips_http_call():
     assert result is None
     fake_get_redis.assert_not_called()
     fake_client_cls.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# _build_holding_data: TOTAL_WITHDRAWAL vs. positive balance/quantity (#819)
+# ---------------------------------------------------------------------------
+
+
+def _investment(
+    *,
+    inv_id: str = "inv-1",
+    status: str = "ACTIVE",
+    balance=None,
+    quantity=None,
+    value=None,
+) -> dict:
+    inv = {
+        "id": inv_id,
+        "name": "PETR4",
+        "type": "EQUITY",
+        "currencyCode": "BRL",
+        "status": status,
+    }
+    if balance is not None:
+        inv["balance"] = balance
+    if quantity is not None:
+        inv["quantity"] = quantity
+    if value is not None:
+        inv["value"] = value
+    return inv
+
+
+def test_holding_total_withdrawal_with_positive_balance_is_not_withdrawn():
+    """Contradictory payload: status says TOTAL_WITHDRAWAL but the same
+    response still reports a positive balance and quantity. The position
+    still holds value, so it must not be treated as sold (issue #819)."""
+    from app.providers.pluggy import _build_holding_data
+
+    holding = _build_holding_data(_investment(
+        status="TOTAL_WITHDRAWAL", balance=1234.56, quantity=10, value=123.46,
+    ))
+
+    assert holding.is_withdrawn is False
+    assert holding.current_value == Decimal("1234.56")
+    assert holding.quantity == Decimal("10")
+
+
+def test_holding_total_withdrawal_with_only_positive_quantity_is_not_withdrawn():
+    """No balance in the payload, but the quantity is still positive: the
+    position is not fully gone."""
+    from app.providers.pluggy import _build_holding_data
+
+    holding = _build_holding_data(_investment(
+        status="TOTAL_WITHDRAWAL", quantity=10, value=123.46,
+    ))
+
+    assert holding.is_withdrawn is False
+    assert holding.current_value == Decimal("0")
+
+
+def test_holding_total_withdrawal_with_negative_balance_is_not_withdrawn():
+    """A nonzero balance means the position is not empty, even when it is
+    negative; it must not be hidden as sold."""
+    from app.providers.pluggy import _build_holding_data
+
+    holding = _build_holding_data(_investment(
+        status="TOTAL_WITHDRAWAL", balance=-12.5, quantity=0,
+    ))
+
+    assert holding.is_withdrawn is False
+    assert holding.current_value == Decimal("-12.5")
+
+
+def test_holding_total_withdrawal_empty_position_is_withdrawn():
+    """A genuinely closed position reports zero balance and zero quantity;
+    that one must still be marked withdrawn."""
+    from app.providers.pluggy import _build_holding_data
+
+    holding = _build_holding_data(_investment(
+        status="TOTAL_WITHDRAWAL", balance=0, quantity=0, value=0,
+    ))
+
+    assert holding.is_withdrawn is True
+
+
+def test_holding_total_withdrawal_without_balance_or_quantity_is_withdrawn():
+    """Some payloads omit both figures entirely; status alone is enough to
+    mark the position closed."""
+    from app.providers.pluggy import _build_holding_data
+
+    holding = _build_holding_data(_investment(status="TOTAL_WITHDRAWAL"))
+
+    assert holding.is_withdrawn is True
+
+
+def test_holding_active_status_is_never_withdrawn():
+    from app.providers.pluggy import _build_holding_data
+
+    holding = _build_holding_data(_investment(
+        status="ACTIVE", balance=100, quantity=1,
+    ))
+
+    assert holding.is_withdrawn is False

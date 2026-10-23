@@ -383,9 +383,10 @@ async def test_generate_title_uses_llm(
     ])
     await session.commit()
 
+    provider = _Scripted()
     with patch(
         "app.agents.runtime.executor._provider_and_model_for",
-        return_value=(_Scripted(), "gpt-4o-mini"),
+        return_value=(provider, "gpt-4o-mini"),
     ):
         r = await client.post(
             f"/api/agents/conversations/{conv.id}/generate-title",
@@ -393,6 +394,8 @@ async def test_generate_title_uses_llm(
         )
     assert r.status_code == 200, r.text
     assert r.json()["title"] == "Brazilian Cuisine Picks"
+    # The title request carries the same session id as the chat run.
+    assert provider.session_id == str(conv.id)
 
 
 async def test_generate_title_strips_reasoning_tags(

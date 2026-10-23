@@ -113,7 +113,7 @@ async def test_get_groups_converts_foreign_currency(session: AsyncSession, test_
                      currency="USD", value_amount=Decimal("10"))
     await session.commit()
 
-    async def _fake_convert(session, amount, frm, to):
+    async def _fake_convert(session, amount, frm, to, *args, **kwargs):
         return Decimal(amount) * Decimal("5"), Decimal("5")
 
     monkeypatch.setattr(svc, "convert", _fake_convert)

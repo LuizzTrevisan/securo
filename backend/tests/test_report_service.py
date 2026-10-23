@@ -2,7 +2,8 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
+from zoneinfo import ZoneInfo
 
 import pytest
 from fastapi import HTTPException
@@ -26,7 +27,9 @@ from app.api.reports import (
     _add_years,
     _financial_year_start_month,
     _reject_unsupported_fiscal_year_report,
+    _resolve_custom_range,
 )
+from app.core.app_clock import today_in, use_resolved_timezone
 from app.services.report_service import (
     _add_months,
     _asset_value_at,
@@ -2833,6 +2836,9 @@ async def test_historical_api_custom_range_boundaries(
             return cls(2026, 9, 12)
 
     monkeypatch.setattr(reports_api, 'date', FixedDate)
+    # The guard reads "today" from the app's calendar, not from the module's
+    # date class, so both seams get the same fixed day.
+    monkeypatch.setattr(reports_api, 'app_today', lambda: FixedDate.today())
     report = ReportResponse(
         summary=ReportSummary(primary_value=0, change_amount=0, change_percent=None,
                               breakdowns=[]),
@@ -2895,3 +2901,103 @@ async def test_custom_dates_override_indian_yearly_ytd(
         assert service.call_args.kwargs['financial_year_start_month'] == 4
     finally:
         app.dependency_overrides.pop(current_workspace, None)
+
+
+# ---------------------------------------------------------------------------
+# _resolve_custom_range: "today" must come from the app's calendar
+# (workspace or application timezone), never the host clock. The service
+# below builds its windows from `app_today()`, so a guard that compares
+# against a different calendar either rejects a legitimate "today" or
+# accepts a future date (issue #840).
+# ---------------------------------------------------------------------------
+
+
+def test_custom_range_accepts_end_date_that_is_app_today():
+    host_today = date.today()
+    # The workspace runs one day ahead of the host clock: its "today" is
+    # what the host only sees as tomorrow, and a report through the app's
+    # today is a normal, current request.
+    with patch("app.api.reports.app_today", return_value=host_today + timedelta(days=1)):
+        start = host_today
+        end = host_today + timedelta(days=1)
+        assert _resolve_custom_range(start, end) == (start, end)
+
+
+def test_custom_range_rejects_end_date_after_app_today():
+    host_today = date.today()
+    # The workspace runs one day behind the host clock: the host's today
+    # is still in the future for the workspace, so it is not a valid end.
+    with patch("app.api.reports.app_today", return_value=host_today - timedelta(days=1)):
+        with pytest.raises(HTTPException) as exc:
+            _resolve_custom_range(host_today - timedelta(days=1), host_today)
+        assert exc.value.detail == "end_date must be on or before today"
+
+
+def _host_and_shifted_zone() -> tuple[ZoneInfo, date, date]:
+    """A zone whose calendar date differs from the host's right now.
+
+    Kiritimati (UTC+14) and Pago Pago (UTC-11) are 25 hours apart, so they
+    always sit on different days, and one of the two always differs from
+    the host's day no matter which offset the host runs on.
+    """
+    host_today = date.today()
+    for name in ("Pacific/Kiritimati", "Pacific/Pago_Pago"):
+        zone = ZoneInfo(name)
+        if today_in(zone) != host_today:
+            return zone, today_in(zone), host_today
+    pytest.fail("expected a zone on a different calendar day from the host")
+
+
+def test_custom_range_guard_follows_resolved_timezone():
+    zone, zone_today, host_today = _host_and_shifted_zone()
+    with use_resolved_timezone(zone):
+        if zone_today > host_today:
+            # Workspace ahead of the host: asking for the workspace's own
+            # today must be accepted.
+            start = zone_today - timedelta(days=7)
+            assert _resolve_custom_range(start, zone_today) == (start, zone_today)
+        else:
+            # Workspace behind the host: the host's today is a future date
+            # for the workspace and must be rejected.
+            with pytest.raises(HTTPException) as exc:
+                _resolve_custom_range(zone_today, host_today)
+            assert exc.value.detail == "end_date must be on or before today"
+
+
+@pytest.mark.asyncio
+async def test_net_worth_keeps_sub_cent_foreign_assets(
+    session: AsyncSession, test_user, test_workspace
+):
+    """Low-priced foreign-currency holdings must add up in the net worth.
+
+    Three coins at 0.001 USD convert to 0.005 BRL each. A two-decimal
+    conversion made each one 0.00 (or 0.01, depending on rounding); converting
+    at price precision and summing in Decimal gives 0.015, shown as 0.02. A
+    float sum would round 0.015 down to 0.01.
+    """
+    from app.models.fx_rate import FxRate
+
+    today = date.today()
+    session.add(FxRate(
+        id=uuid.uuid4(), base_currency="USD", quote_currency="BRL",
+        date=today, rate=Decimal("5.0"), source="test",
+    ))
+    for i in range(3):
+        coin = Asset(
+            id=uuid.uuid4(), user_id=test_user.id, name=f"Coin {i}",
+            type="investment", currency="USD", valuation_method="market_price",
+            units=Decimal("1"), last_price=Decimal("0.001"), position=i,
+        )
+        session.add(coin)
+        await session.flush()
+        session.add(AssetValue(
+            id=uuid.uuid4(), asset_id=coin.id,
+            amount=Decimal("0.001"), date=today, source="sync",
+        ))
+    await session.commit()
+
+    total = await _asset_value_at(session, test_workspace.id, today, "BRL")
+    assert total == pytest.approx(0.015)
+
+    point = await _net_worth_at(session, test_workspace.id, today, "BRL")
+    assert point.breakdowns["assets"] == pytest.approx(0.02)

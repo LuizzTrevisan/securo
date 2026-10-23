@@ -571,7 +571,7 @@ class EnableBankingProvider(BankProvider):
         uids = self._account_uids(data)
         # EB keys each account by a uid scoped to this session; the
         # identification_hash is the id that survives a reauthorisation. It comes
-        # in the same payload we just fetched, so carry it through — otherwise a
+        # in the same payload we just fetched, so carry it through; otherwise a
         # reconnect re-keys every account and the sync duplicates them all.
         stable_external_ids = {
             entry.get("uid"): entry.get("identification_hash")

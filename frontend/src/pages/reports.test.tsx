@@ -334,3 +334,75 @@ describe('Reports page, cash-flow runway', () => {
     expect(screen.queryByTestId('cash-flow-runway')).not.toBeInTheDocument()
   })
 })
+
+describe('Reports page: month presets and period navigation (issue #519)', () => {
+  it('offers This Month and Last Month with exact month windows', async () => {
+    const { user } = renderWithProviders(<ReportsPage />)
+    expect(await screen.findByRole('heading', { name: 'Net Worth' })).toBeInTheDocument()
+
+    // The default preset (1Y) keeps the API-anchored window: no explicit dates.
+    expect(api.reports.netWorth.mock.calls.at(-1)?.slice(-2)).toEqual([undefined, undefined])
+
+    await user.click(screen.getByRole('button', { name: 'This Month' }))
+    expect(api.reports.netWorth.mock.calls.at(-1)?.slice(-2)).toEqual(['2026-09-01', '2026-09-12'])
+    expect(screen.getByTestId('reports-period-label')).toHaveTextContent('September 2026')
+
+    await user.click(screen.getByRole('button', { name: 'Last Month' }))
+    expect(api.reports.netWorth.mock.calls.at(-1)?.slice(-2)).toEqual(['2026-08-01', '2026-08-31'])
+    expect(screen.getByTestId('reports-period-label')).toHaveTextContent('August 2026')
+  })
+
+  it('steps the active period back and forward with the arrows', async () => {
+    const { user } = renderWithProviders(<ReportsPage />)
+    await screen.findByRole('heading', { name: 'Net Worth' })
+    await user.click(screen.getByRole('button', { name: 'This Month' }))
+
+    const prev = screen.getByRole('button', { name: 'Previous period' })
+    const next = screen.getByRole('button', { name: 'Next period' })
+    expect(next).toBeDisabled()
+
+    await user.click(prev)
+    expect(screen.getByTestId('reports-period-label')).toHaveTextContent('August 2026')
+    expect(api.reports.netWorth.mock.calls.at(-1)?.slice(-2)).toEqual(['2026-08-01', '2026-08-31'])
+    expect(next).not.toBeDisabled()
+
+    await user.click(next)
+    expect(screen.getByTestId('reports-period-label')).toHaveTextContent('September 2026')
+    expect(api.reports.netWorth.mock.calls.at(-1)?.slice(-2)).toEqual(['2026-09-01', '2026-09-12'])
+    expect(next).toBeDisabled()
+  })
+
+  it('steps a macro preset back by a whole window and labels the covered span', async () => {
+    const { user } = renderWithProviders(<ReportsPage />)
+    await screen.findByRole('heading', { name: 'Net Worth' })
+    await user.click(screen.getByRole('button', { name: '6M' }))
+
+    expect(screen.getByTestId('reports-period-label')).toHaveTextContent('6M')
+    await user.click(screen.getByRole('button', { name: 'Previous period' }))
+
+    expect(api.reports.netWorth.mock.calls.at(-1)?.slice(-2)).toEqual(['2025-08-01', '2026-02-28'])
+    expect(screen.getByTestId('reports-period-label')).toHaveTextContent('Aug 2025 - Feb 2026')
+  })
+
+  it('does not carry a stepped window into the Cash Flow forecast', async () => {
+    const { user } = renderWithProviders(<ReportsPage />)
+    await screen.findByRole('heading', { name: 'Net Worth' })
+    await user.click(screen.getByRole('button', { name: '6M' }))
+    await user.click(screen.getByRole('button', { name: 'Previous period' }))
+
+    await user.click(screen.getByRole('button', { name: t('reports.cashFlow') }))
+    await waitFor(() => expect(api.reports.cashFlow).toHaveBeenCalled())
+
+    expect(api.reports.cashFlow.mock.calls.at(-1)?.[0]).toBe(6)
+  })
+
+  it('hides period navigation on the forward-only Cash Flow tab', async () => {
+    const { user } = renderWithProviders(<ReportsPage />)
+    await screen.findByRole('heading', { name: 'Net Worth' })
+    expect(screen.getByRole('button', { name: 'Previous period' })).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: t('reports.cashFlow') }))
+    expect(screen.queryByRole('button', { name: 'Previous period' })).not.toBeInTheDocument()
+    expect(screen.queryByTestId('reports-period-nav')).not.toBeInTheDocument()
+  })
+})

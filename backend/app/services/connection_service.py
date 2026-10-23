@@ -4,7 +4,7 @@ import re
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Optional
+from typing import Literal, Optional
 
 from sqlalchemy import delete, exists, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
@@ -34,6 +34,7 @@ from app.providers.base import (
     ProviderRateLimited,
     ProviderUserActionRequired,
     SessionExpiredError,
+    TransactionData,
 )
 from app.services import oauth_state
 from app.services import admin_service
@@ -848,6 +849,41 @@ async def _match_pluggy_category(
     return result.scalars().first()
 
 
+def _bank_converted_amount(
+    txn_data: TransactionData, account_currency: str, user_currency: str
+) -> Optional[Decimal]:
+    """The bank's own conversion of a foreign charge into the primary currency.
+
+    Only when the account is held in the primary currency, so the figure the
+    bank charged the account is the primary amount. None otherwise.
+    """
+    if (
+        txn_data.amount_in_account_currency is not None
+        and txn_data.amount
+        and account_currency == user_currency
+        and txn_data.currency != account_currency
+    ):
+        return txn_data.amount_in_account_currency
+    return None
+
+
+async def _stamp_synced_primary_amount(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    transaction: Transaction,
+    converted: Optional[Decimal],
+) -> None:
+    """Prefer the bank's conversion (see _bank_converted_amount); else use our FX rates.
+
+    The transaction's amount must already be the charged amount.
+    """
+    if converted is not None:
+        transaction.amount_primary = converted
+        transaction.fx_rate_used = converted / transaction.amount
+    else:
+        await stamp_primary_amount(session, user_id, transaction)
+
+
 async def _find_installment_category(
     session: AsyncSession,
     account_id: uuid.UUID,
@@ -1249,18 +1285,13 @@ async def handle_oauth_callback(
             if transaction.category_id is None:
                 transaction.category_id = category_id
 
-            # Prefer bank-provided conversion for international transactions
             acct_currency = acc_data.currency or user_currency
-            if (
-                txn_data.amount_in_account_currency is not None
-                and txn_data.amount
-                and acct_currency == user_currency
-                and txn_data.currency != acct_currency
-            ):
-                transaction.amount_primary = txn_data.amount_in_account_currency
-                transaction.fx_rate_used = txn_data.amount_in_account_currency / txn_data.amount
-            else:
-                await stamp_primary_amount(session, user_id, transaction)
+            await _stamp_synced_primary_amount(
+                session,
+                user_id,
+                transaction,
+                _bank_converted_amount(txn_data, acct_currency, user_currency),
+            )
 
         # After importing the initial batch, reconcile the opening balance so
         # that SUM(all transactions) matches the provider-reported balance. Any
@@ -1332,8 +1363,8 @@ async def _find_existing_connected_account(
 
     # The provider re-keyed this account. Enable Banking issues a `uid` scoped to
     # one session, so reauthorising changes it while `stable_external_id` (the
-    # identification_hash) survives. Rebind the existing row — keeping its
-    # transactions, rules and name overrides — instead of inserting a duplicate.
+    # identification_hash) survives. Rebind the existing row, keeping its
+    # transactions, rules and name overrides, instead of inserting a duplicate.
     # EB does not guarantee the hash is unique, so require exactly one unclaimed
     # candidate: a row another incoming account already took in this run carries
     # an external_id that is in the batch, and adopting it a second time would
@@ -1355,11 +1386,11 @@ async def _find_existing_connected_account(
             return stable_rows[0]
 
     # Last resort for rows that predate `stable_external_id` (added by migration
-    # 097, and only ever backfilled by a *successful* sync — which a user whose
+    # 097, and only ever backfilled by a *successful* sync, which a user whose
     # bank was failing never had). The masked identifier is the closest thing to
     # an account number we keep. Two guards, both fail-closed: a single candidate
     # (a shared last-4 must never merge two accounts), and candidates limited to
-    # rows with no stable id — a row that is already identified is a different
+    # rows with no stable id: a row that is already identified is a different
     # account, so adopting it would overwrite its identity and mix histories.
     if connection.provider == "enable_banking" and acc_data.masked_number:
         masked_rows = (await session.execute(
@@ -1966,13 +1997,24 @@ async def _sync_credit_card_bills(
     return by_external_id
 
 
+# Outcome of a sync that completed without raising, reported to the caller
+# so the UI can tell "data read" from "the provider throttled us and nothing
+# was pulled" (issue #736). "refreshed" covers the normal path (the data may
+# be the provider's cached copy; whether a fresh pull happened is the
+# provider's own semantics). "rate_limited" means the provider returned a
+# 429: nothing was pulled and last_sync_at was left untouched so the next
+# sync retries the same window. Errors (expired session, user action
+# required, generic failure) still propagate as exceptions.
+SyncOutcome = Literal["refreshed", "rate_limited"]
+
+
 async def sync_connection(
     session: AsyncSession,
     connection_id: uuid.UUID,
     workspace_id: uuid.UUID,
     requesting_user_id: uuid.UUID,
     trigger_provider_refresh: bool = False,
-) -> tuple[BankConnection, int]:
+) -> tuple[BankConnection, int, SyncOutcome]:
     connection = await get_connection(
         session, connection_id, workspace_id, for_update=True
     )
@@ -2323,6 +2365,10 @@ async def sync_connection(
                 incoming_currency = (
                     txn_data.currency or acc_data.currency or user_currency
                 )
+                acct_currency = acc_data.currency or user_currency
+                converted = _bank_converted_amount(
+                    txn_data, acct_currency, user_currency
+                )
                 category_id = await _find_installment_category(
                     session, account.id, txn_data
                 )
@@ -2410,6 +2456,15 @@ async def sync_connection(
                     # win, the charge fills the empty ones, and only its
                     # provenance is recorded outright.
                     placeholder.original_description = txn_data.description
+                    if placeholder.amount != txn_data.amount or converted is not None:
+                        # Matched under a tolerance, or the bank said what the
+                        # charge cost in the primary currency: the row now
+                        # stands for what was actually charged, not for what
+                        # the bill expected.
+                        placeholder.amount = txn_data.amount
+                        await _stamp_synced_primary_amount(
+                            session, user_id, placeholder, converted
+                        )
                     if placeholder.category_id is None:
                         placeholder.category_id = preview.category_id or category_id
                     if txn_data.payee and not placeholder.payee:
@@ -2450,18 +2505,9 @@ async def sync_connection(
                 if transaction.category_id is None:
                     transaction.category_id = category_id
 
-                # Prefer bank-provided conversion for international transactions
-                acct_currency = acc_data.currency or user_currency
-                if (
-                    txn_data.amount_in_account_currency is not None
-                    and txn_data.amount
-                    and acct_currency == user_currency
-                    and txn_data.currency != acct_currency
-                ):
-                    transaction.amount_primary = txn_data.amount_in_account_currency
-                    transaction.fx_rate_used = txn_data.amount_in_account_currency / txn_data.amount
-                else:
-                    await stamp_primary_amount(session, user_id, transaction)
+                await _stamp_synced_primary_amount(
+                    session, user_id, transaction, converted
+                )
 
             # Reconcile the opening balance after any new transactions land so
             # SUM(all txs) keeps matching account.balance from the provider.
@@ -2551,7 +2597,7 @@ async def sync_connection(
             connection.status = "active"
         await session.commit()
         await session.refresh(connection)
-        return connection, merged_count
+        return connection, merged_count, "refreshed"
 
     except SessionExpiredError:
         # Provider consent expired — distinct from a generic error so the UI
@@ -2587,7 +2633,9 @@ async def sync_connection(
         # to the one we already hold rather than raising: re-raising here would
         # escape as a 500, which is exactly what this handler exists to avoid.
         refreshed = await session.get(BankConnection, connection_id)
-        return refreshed or connection, 0
+        # Report "rate_limited" so the caller (manual sync endpoint, UI) knows
+        # no fresh data was pulled and can say so instead of a success toast.
+        return refreshed or connection, 0, "rate_limited"
     except Exception:
         # Mark connection as errored so UI shows reconnect banner
         await session.rollback()

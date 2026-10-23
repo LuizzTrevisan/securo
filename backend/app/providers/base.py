@@ -57,8 +57,8 @@ def mask_last4(value: Optional[str]) -> Optional[str]:
 class AccountData:
     # The provider's identifier for this account. It is expected to be stable
     # across re-syncs, and the sync matches an incoming account on it first. A
-    # provider that re-keys it — Enable Banking mints a `uid` scoped to a single
-    # session — must also set `stable_external_id`, or re-syncing inserts a
+    # provider that re-keys it (Enable Banking mints a `uid` scoped to a single
+    # session) must also set `stable_external_id`, or re-syncing inserts a
     # duplicate instead of recognising the account it already imported.
     external_id: str
     name: str

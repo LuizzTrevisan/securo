@@ -8,7 +8,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
-from app.models.asset import Asset
+from app.models.asset import ASSET_PRICE_DECIMALS, Asset
 from app.models.asset_group import AssetGroup
 from app.models.asset_value import AssetValue
 from app.models.bank_connection import BankConnection
@@ -107,7 +107,8 @@ async def _rollup(
             current_value_primary += latest
         else:
             converted, _ = await convert(
-                session, latest, asset.currency, primary_currency
+                session, latest, asset.currency, primary_currency,
+                decimals=ASSET_PRICE_DECIMALS,
             )
             current_value_primary += converted
     return asset_count, current_value, current_value_primary

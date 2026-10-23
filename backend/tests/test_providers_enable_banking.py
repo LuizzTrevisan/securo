@@ -561,7 +561,7 @@ async def test_get_accounts_raises_session_expired_when_details_unauthorized(eb_
 
     ``_request`` maps 401/410 to SessionExpiredError precisely because EB's
     access token is session-scoped: the consent is dead for every account. The
-    per-account ``except httpx.HTTPError`` must not swallow it — doing so stored
+    per-account ``except httpx.HTTPError`` must not swallow it; doing so stored
     an empty account list and left the connection "active" (issue #1013).
     """
     provider = EnableBankingProvider()
@@ -589,7 +589,7 @@ async def test_get_accounts_exposes_stable_external_id(eb_keys):
 
     Reauthorising mints a new session, so the same real account comes back with
     a new uid. The hash is what survives that, and it already rides in the
-    /sessions payload this method fetches — carry it out on AccountData so the
+    /sessions payload this method fetches. Carry it out on AccountData so the
     sync can re-match the existing row instead of creating a duplicate.
     """
     provider = EnableBankingProvider()

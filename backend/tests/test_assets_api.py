@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.asset import Asset
 from app.models.asset_value import AssetValue
+from app.models.fx_rate import FxRate
 from app.models.user import User
 from app.models.workspace import Workspace, WorkspaceMember
 from app.schemas.asset import MarketSymbolQuote
@@ -309,3 +310,120 @@ async def test_get_value_trend(client: AsyncClient, auth_headers: dict, test_ass
 async def test_unauthenticated_access(client: AsyncClient):
     response = await client.get("/api/assets")
     assert response.status_code == 401
+
+
+class TestAssetValuePrecision:
+    """FX conversion of asset values keeps price-field precision (issue #622).
+
+    A low-priced market asset held by a user in another currency must not
+    vanish from the primary-currency total: the converted value is rounded at
+    the asset price precision (six decimals), not the monetary two.
+    """
+
+    @pytest_asyncio.fixture
+    async def eur_rate(self, session: AsyncSession, clean_db) -> FxRate:
+        """USD -> EUR 0.92, same value the fx_rates fixture uses."""
+        fx = FxRate(
+            base_currency="USD",
+            quote_currency="EUR",
+            date=date.today(),
+            rate=Decimal("0.9200000000"),
+            source="test",
+        )
+        session.add(fx)
+        await session.commit()
+        await session.refresh(fx)
+        return fx
+
+    @pytest_asyncio.fixture
+    async def eur_user(
+        self, session: AsyncSession, test_user: User
+    ) -> User:
+        """The test user reads the portfolio in EUR, not BRL."""
+        test_user.preferences = {**(test_user.preferences or {}), "currency_display": "EUR"}
+        await session.commit()
+        return test_user
+
+    @pytest.mark.asyncio
+    async def test_list_keeps_sub_cent_value_in_primary_currency(
+        self,
+        client: AsyncClient,
+        auth_headers: dict,
+        session: AsyncSession,
+        eur_user: User,
+        test_workspace: Workspace,
+        eur_rate: FxRate,
+    ):
+        # One unit of a low-priced coin, worth a fraction of a cent.
+        asset = Asset(
+            id=uuid.uuid4(),
+            user_id=eur_user.id,
+            workspace_id=test_workspace.id,
+            name="Coin A",
+            type="investment",
+            currency="USD",
+            units=Decimal("1"),
+            valuation_method="market_price",
+            purchase_price=Decimal("0.00"),
+            last_price=Decimal("0.002087"),
+            ticker="COIN-USD",
+            position=0,
+        )
+        session.add(asset)
+        await session.commit()
+
+        headers = {**auth_headers, "X-Workspace-Id": str(test_workspace.id)}
+        response = await client.get("/api/assets", headers=headers)
+
+        assert response.status_code == 200
+        entry = next(a for a in response.json() if a["id"] == str(asset.id))
+        # 0.002087 USD * 0.92 = 0.001920 EUR at price precision. The
+        # two-decimal quantization the issue reports returned 0.0 here.
+        assert entry["current_value"] == pytest.approx(0.002087)
+        assert entry["current_value_primary"] == pytest.approx(0.00192)
+        assert entry["gain_loss"] == pytest.approx(0.002087)
+        assert entry["gain_loss_primary"] == pytest.approx(0.00192)
+
+    @pytest.mark.asyncio
+    async def test_values_at_total_keeps_sub_cent_assets(
+        self,
+        session: AsyncSession,
+        eur_user: User,
+        test_workspace: Workspace,
+        eur_rate: FxRate,
+    ):
+        """get_asset_values_at (the rollup behind the dashboard total and the
+        trend chart) must not drop low-priced holdings from the primary
+        total: each converted amount keeps six decimals, so the sum of
+        sub-cent values is correct. 2 x 0.002087 USD = 0.004174, and
+        0.002087 x 0.92 = 0.001920 per coin. Before the fix each asset
+        converted to 0.0 separately and the primary total was 0.0."""
+        from app.services.asset_service import get_asset_values_at
+
+        for i in range(2):
+            session.add(
+                Asset(
+                    id=uuid.uuid4(),
+                    user_id=eur_user.id,
+                    workspace_id=test_workspace.id,
+                    name=f"Coin {i}",
+                    type="investment",
+                    currency="USD",
+                    units=Decimal("1"),
+                    valuation_method="market_price",
+                    last_price=Decimal("0.002087"),
+                    ticker="COIN-USD",
+                    position=i,
+                )
+            )
+        await session.commit()
+
+        totals, primary_total = await get_asset_values_at(
+            session,
+            test_workspace.id,
+            primary_currency="EUR",
+            by_workspace=True,
+        )
+
+        assert totals["USD"] == pytest.approx(0.004174)
+        assert primary_total == pytest.approx(0.00384)

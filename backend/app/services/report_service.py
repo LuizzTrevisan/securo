@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.app_clock import app_today
 from app.core.config import get_settings
 from app.models.account import Account
-from app.models.asset import Asset
+from app.models.asset import ASSET_PRICE_DECIMALS, Asset
 from app.models.asset_value import AssetValue
 from app.models.transaction import Transaction
 from app.models.category import Category
@@ -123,7 +123,8 @@ async def _asset_value_at(
             amount = 0.0
         if amount > 0:
             converted, _ = await convert(
-                session, Decimal(str(amount)), asset.currency, primary_currency, cutoff
+                session, Decimal(str(amount)), asset.currency, primary_currency, cutoff,
+                decimals=ASSET_PRICE_DECIMALS,
             )
             total += float(converted)
     return total
@@ -209,7 +210,9 @@ async def _net_worth_at(
     if filtered:
         asset_stmt = asset_stmt.where(Asset.group_id.in_(asset_group_ids or []))
     asset_result = await session.execute(asset_stmt)
-    assets_total = 0.0
+    # Decimal until the one final rounding: sub-cent holdings must add up
+    # exactly the way the wallet rollup does.
+    assets_sum = Decimal("0")
     for asset in asset_result.scalars().all():
         val_result = await session.execute(
             select(AssetValue.amount)
@@ -228,10 +231,11 @@ async def _net_worth_at(
             amount = 0.0
         if amount > 0:
             converted, _ = await convert(
-                session, Decimal(str(amount)), asset.currency, primary_currency, cutoff
+                session, Decimal(str(amount)), asset.currency, primary_currency, cutoff,
+                decimals=ASSET_PRICE_DECIMALS,
             )
             converted_val = round(float(converted), 2)
-            assets_total += converted_val
+            assets_sum += converted
             composition.append(ReportCompositionItem(
                 key=str(asset.id),
                 label=asset.name,
@@ -240,6 +244,7 @@ async def _net_worth_at(
                 group="assets",
             ))
 
+    assets_total = float(assets_sum.quantize(Decimal("0.01")))
     net_worth = accounts_total + assets_total - liabilities_total
 
     return ReportDataPoint(

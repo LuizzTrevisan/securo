@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useContext, useEffect, useState } from 'react'
 import { loadReportsRange, saveReportsRange, type ReportsRange } from '@/lib/remembered-range'
 import { useTranslation } from 'react-i18next'
 import { useDisplayLocale } from '@/hooks/use-display-locale'
@@ -19,7 +19,7 @@ import {
   ReferenceLine,
   ResponsiveContainer,
 } from 'recharts'
-import { AlertCircle, HelpCircle, X } from 'lucide-react'
+import { AlertCircle, ChevronLeft, ChevronRight, HelpCircle, X } from 'lucide-react'
 import { reports } from '@/lib/api'
 import { extractApiError } from '@/lib/api-errors'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -36,7 +36,15 @@ import { useCollectionFilter } from '@/contexts/collection-filter-context'
 import type { ReportResponse, CategoryTrendItem } from '@/types'
 import { formatCurrency } from '@/lib/format'
 import { localDateString, todayInTimezone } from '@/lib/date-utils'
+import { monthLabel } from '@/lib/month-utils'
+import { periodWindow, windowMonths, type PeriodPreset } from '@/lib/report-period'
 import { useEffectiveTimezone } from '@/hooks/use-timezone'
+import { WorkspaceContext } from '@/contexts/workspace-context'
+import {
+  formatNetWorthAxisTick,
+  getNetWorthDomain,
+  shouldFillNetWorthArea,
+} from '@/lib/net-worth-chart-utils'
 
 // A small qualitative palette of well-separated hues for the composition
 // detail ring. Capped to a handful of slices, distinct colours make each
@@ -67,13 +75,22 @@ function formatCompact(value: number, currency = 'USD', locale = 'en-US') {
   }).format(value)
 }
 
+/** "Apr 2026" from a YYYY-MM-DD date, in the display locale. */
+function formatShortMonth(isoDate: string, locale: string) {
+  const [y, m] = isoDate.split('-').map(Number)
+  return new Date(y, m - 1, 1).toLocaleDateString(locale, { month: 'short', year: 'numeric' })
+}
+
 
 
 // `days` (when set) asks for an exact rolling window ending today rather than
-// the month-aligned window `months` produces.
-type RangeOption = { key: string; months: number; period?: 'ytd'; days?: number }
+// the month-aligned window `months` produces. `monthAnchor` marks the month
+// presets (This Month / Last Month), which always send explicit dates.
+type RangeOption = { key: string; months: number; period?: 'ytd'; days?: number; monthAnchor?: number }
 
 const HISTORICAL_RANGE_OPTIONS: readonly RangeOption[] = [
+  { key: 'this_month', months: 1, monthAnchor: 0 },
+  { key: 'last_month', months: 1, monthAnchor: -1 },
   { key: '6m', months: 6 },
   { key: 'ytd', months: 12, period: 'ytd' },
   { key: '1y', months: 12 },
@@ -89,6 +106,8 @@ const FORWARD_RANGE_OPTIONS: readonly RangeOption[] = [
 // The Money Map answers "where did my money go lately", so it leans on recent
 // windows (down to 30 days) and drops the 2Y trend view the other tabs keep.
 const MONEY_MAP_RANGE_OPTIONS: readonly RangeOption[] = [
+  { key: 'this_month', months: 1, monthAnchor: 0 },
+  { key: 'last_month', months: 1, monthAnchor: -1 },
   { key: '30d', months: 1, days: 30 },
   { key: '3m', months: 3 },
   { key: '6m', months: 6 },
@@ -124,6 +143,8 @@ const RANGE_LABELS: Record<string, string> = {
   ytd: 'rangeYtd',
   '12m': 'range12m',
   '2y': 'range2y',
+  this_month: 'rangeThisMonth',
+  last_month: 'rangeLastMonth',
   custom: 'customRange',
 }
 
@@ -203,6 +224,12 @@ function storedReportsRange(tab: ReportTab): ReportsRange | null {
 
 export default function ReportsPage() {
   const timeZone = useEffectiveTimezone()
+  // Read through the context object so the page still renders outside a
+  // WorkspaceProvider. Mirrors the backend's financial year start (April for
+  // India, January elsewhere), so stepping back from YTD lands on whole
+  // financial years.
+  const workspaceCtx = useContext(WorkspaceContext)
+  const fyStartMonth = (workspaceCtx?.current?.tax_jurisdiction ?? '').toUpperCase() === 'IN' ? 4 : 1
   const { t } = useTranslation()
   const { mask, privacyMode, MASK } = usePrivacyMode()
   const { user } = useAuth()
@@ -226,12 +253,15 @@ export default function ReportsPage() {
   // selection while the user compares views.
   const [customFrom, setCustomFrom] = useState(initialRange.from)
   const [customTo, setCustomTo] = useState(initialRange.to)
+  // Period navigation (issue #519): how many periods of the active preset the
+  // window has been stepped back. 0 means the window still ends today.
+  const [periodOffset, setPeriodOffset] = useState(initialRange.periodOffset ?? 0)
   const [activeTab, setActiveTab] = useState(REPORT_TABS[0].key)
   // Each tab keeps its own range: Cash Flow clamping to its forward presets
   // must not overwrite what Net Worth was showing.
   useEffect(() => {
-    saveReportsRange(activeTab, { rangeKey, from: customFrom, to: customTo, interval })
-  }, [activeTab, rangeKey, customFrom, customTo, interval])
+    saveReportsRange(activeTab, { rangeKey, from: customFrom, to: customTo, interval, periodOffset })
+  }, [activeTab, rangeKey, customFrom, customTo, interval, periodOffset])
   const [compositionView, setCompositionView] = useState<string>('netWorth')
   const [sparklineView, setSparklineView] = useState<'byExpenses' | 'byIncome'>('byExpenses')
   const [sparklinePage, setSparklinePage] = useState(0)
@@ -269,6 +299,24 @@ export default function ReportsPage() {
   const isCustomRange = supportsCustomRange && rangeKey === CUSTOM_RANGE_KEY
   const hasCustomRange = isCustomRange && !!customFrom && !!customTo
   const selectedRange = rangeOptions.find((r) => r.key === rangeKey) ?? rangeOptions[0]
+  // Period navigation (issue #519): a nonzero offset re-sends the same window
+  // stepped back by its own length, as explicit start/end dates. At offset 0
+  // the presets keep the API's `months` / `period` / `days` anchoring, so
+  // existing behavior and cache keys are untouched.
+  const periodPreset: PeriodPreset = isCustomRange
+    ? { kind: 'custom' }
+    : selectedRange.monthAnchor !== undefined
+      ? { kind: 'month', anchorDelta: selectedRange.monthAnchor }
+      : selectedRange.period === 'ytd'
+        ? { kind: 'ytd', fyStartMonth }
+        : selectedRange.days
+          ? { kind: 'days', days: selectedRange.days }
+          : { kind: 'rolling', months: selectedRange.months }
+  // Cash Flow is a forward projection with no period navigation: it never
+  // takes a stepped window, even if an offset was carried over from another tab.
+  const navWindow = isCashFlow
+    ? null
+    : periodWindow(periodPreset, todayInTimezone(timeZone), periodOffset, { from: customFrom, to: customTo })
   // In custom mode, translate the picked span into an equivalent `months`
   // value so downstream logic (interval bucketing, forecast fan-out) keeps
   // working. Backend uses start_date/end_date directly when they're set.
@@ -285,11 +333,23 @@ export default function ReportsPage() {
         ),
       )
     : selectedRange.months
-  const months = isCustomRange ? customMonths : selectedRange.months
-  const period = isCustomRange ? undefined : selectedRange.period
-  const days = isCustomRange ? undefined : selectedRange.days
-  const apiStart = hasCustomRange ? customFrom : undefined
-  const apiEnd = hasCustomRange ? customTo : undefined
+  const months = navWindow ? windowMonths(navWindow) : isCustomRange ? customMonths : selectedRange.months
+  const period = navWindow || isCustomRange ? undefined : selectedRange.period
+  const days = navWindow || isCustomRange ? undefined : selectedRange.days
+  const apiStart = navWindow ? navWindow.from : hasCustomRange ? customFrom : undefined
+  const apiEnd = navWindow ? navWindow.to : hasCustomRange ? customTo : undefined
+  // Label for the period being viewed: the month name for the month presets,
+  // the covered span when the window has been stepped back or is custom, and
+  // the preset's own name while the window still ends today.
+  const activeWindow = navWindow ?? (hasCustomRange ? { from: customFrom, to: customTo } : null)
+  const periodLabel =
+    isCustomRange && !activeWindow
+      ? t('reports.customRange')
+      : activeWindow && selectedRange.monthAnchor !== undefined
+        ? monthLabel(activeWindow.from.slice(0, 7), locale)
+        : activeWindow
+          ? `${formatShortMonth(activeWindow.from, locale)} - ${formatShortMonth(activeWindow.to, locale)}`
+          : t(`reports.${RANGE_LABELS[selectedRange.key]}`)
 
   const handleSelectTab = (key: string) => {
     const nextTab = REPORT_TABS.find((tab) => tab.key === key) ?? REPORT_TABS[0]
@@ -301,6 +361,7 @@ export default function ReportsPage() {
     if (remembered) {
       setRangeKey(remembered.rangeKey)
       setInterval(remembered.interval)
+      setPeriodOffset(nextTab.key === 'cash_flow' ? 0 : (remembered.periodOffset ?? 0))
       if (remembered.rangeKey === CUSTOM_RANGE_KEY) {
         setCustomFrom(remembered.from)
         setCustomTo(remembered.to)
@@ -313,6 +374,9 @@ export default function ReportsPage() {
       nextTab.rangeOptions.some((r) => r.key === rangeKey)
     if (!stillValid) {
       setRangeKey(nextTab.fallbackRangeKey)
+      setPeriodOffset(0)
+    } else if (nextTab.key === 'cash_flow') {
+      setPeriodOffset(0)
     }
     if (!nextTab.intervalOptions.some((i) => i.value === interval)) {
       setInterval(nextTab.fallbackInterval)
@@ -357,6 +421,11 @@ export default function ReportsPage() {
       ...breakdowns,
     } as Record<string, string | number | null>
   })
+  const netWorthDomain = getNetWorthDomain(
+    chartData
+      .map((point) => point.value)
+      .filter((value): value is number => typeof value === 'number'),
+  )
 
   // Cash-flow runway: the first projected day below zero and the lowest
   // point of the horizon, both computed day by day on the backend.
@@ -616,7 +685,7 @@ export default function ReportsPage() {
             onSettingsChange={updateStatementSettings}
           />
         ) : (
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             {isCashFlow && (
               <div
                 className={`flex items-center gap-2 rounded-lg border px-3 py-1.5 text-xs font-semibold transition-colors ${
@@ -657,7 +726,7 @@ export default function ReportsPage() {
               {rangeOptions.map((opt) => (
                 <button
                   key={opt.key}
-                  onClick={() => { setRangeKey(opt.key); setSelectedDate(null) }}
+                  onClick={() => { setRangeKey(opt.key); setPeriodOffset(0); setSelectedDate(null) }}
                   className={`px-3 py-1.5 text-xs font-semibold transition-colors ${
                     rangeKey === opt.key
                       ? 'bg-primary text-primary-foreground'
@@ -680,6 +749,7 @@ export default function ReportsPage() {
                   onChange={(f, to) => {
                     setCustomFrom(f)
                     setCustomTo(to)
+                    setPeriodOffset(0)
                     setRangeKey(f && to ? CUSTOM_RANGE_KEY : currentTab.fallbackRangeKey)
                     setSelectedDate(null)
                   }}
@@ -688,6 +758,39 @@ export default function ReportsPage() {
                 />
               )}
             </div>
+            {/* Period navigation (issue #519): step the active window back and
+                forward through history, labeled with the period it shows. The
+                Cash Flow tab is a forward-only forecast, so it has no past to
+                step through. */}
+            {!isCashFlow && (
+              <div
+                className="flex items-center rounded-lg border border-border bg-card overflow-hidden"
+                data-testid="reports-period-nav"
+              >
+                <button
+                  type="button"
+                  aria-label={t('reports.periodPrev')}
+                  title={t('reports.periodPrev')}
+                  onClick={() => { setPeriodOffset((o) => o - 1); setSelectedDate(null) }}
+                  className="px-2 py-1.5 text-muted-foreground transition-colors hover:text-foreground hover:bg-muted/50"
+                >
+                  <ChevronLeft className="h-4 w-4" />
+                </button>
+                <span className="min-w-24 px-1 text-center text-xs font-semibold tabular-nums" data-testid="reports-period-label">
+                  {periodLabel}
+                </span>
+                <button
+                  type="button"
+                  aria-label={t('reports.periodNext')}
+                  title={t('reports.periodNext')}
+                  disabled={periodOffset === 0}
+                  onClick={() => { setPeriodOffset((o) => o + 1); setSelectedDate(null) }}
+                  className="px-2 py-1.5 text-muted-foreground transition-colors hover:text-foreground hover:bg-muted/50 disabled:opacity-40 disabled:hover:bg-transparent"
+                >
+                  <ChevronRight className="h-4 w-4" />
+                </button>
+              </div>
+            )}
             <div className={`flex items-center rounded-lg border border-border bg-card overflow-hidden ${isMoneyMap ? 'hidden' : ''}`}>
               {intervalOptions.map((opt) => (
                 <button
@@ -1113,15 +1216,15 @@ export default function ReportsPage() {
                   interval="preserveStartEnd"
                 />
                 <YAxis
+                  domain={netWorthDomain}
                   tickFormatter={(v) => {
                     if (privacyMode) return ''
-                    if (v === 0) return '0'
-                    return formatCompact(v, userCurrency, locale)
+                    return formatNetWorthAxisTick(v, netWorthDomain, userCurrency, locale)
                   }}
                   tick={{ fontSize: 10, fill: 'var(--muted-foreground)' }}
                   axisLine={false}
                   tickLine={false}
-                  width={64}
+                  width={88}
                   tickCount={5}
                 />
                 <Tooltip
@@ -1154,7 +1257,7 @@ export default function ReportsPage() {
                   dataKey="value"
                   stroke="#6366F1"
                   strokeWidth={2.5}
-                  fill="url(#netWorthGrad)"
+                  fill={shouldFillNetWorthArea(netWorthDomain) ? 'url(#netWorthGrad)' : 'none'}
                   dot={false}
                   activeDot={{ r: 4, fill: '#6366F1' }}
                 />

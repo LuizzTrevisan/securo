@@ -205,12 +205,18 @@ async def convert(
     target_date: Optional[date] = None,
     *,
     allow_fetch: bool = True,
+    decimals: int = 2,
 ) -> tuple[Decimal, Decimal]:
     """Convert an amount from one currency to another.
 
     Returns (converted_amount, rate_used). Uses the 1:1 fallback from
     :func:`get_rate` when no rate is available, so this is for live reads, not
     for persisting a stored conversion.
+
+    ``decimals`` controls the precision of the converted amount. Monetary
+    amounts keep the two-decimal default; asset values pass the price-field
+    precision (``ASSET_PRICE_DECIMALS``) so a sub-cent market price survives
+    the conversion instead of rounding to 0.00 (issue #622).
     """
     if from_currency == to_currency:
         return amount, Decimal("1")
@@ -219,7 +225,7 @@ async def convert(
         session, from_currency, to_currency, target_date, allow_fetch=allow_fetch
     )
     converted = amount * rate
-    return converted.quantize(Decimal("0.01")), rate
+    return converted.quantize(Decimal(1).scaleb(-decimals)), rate
 
 
 async def stamp_primary_amount(

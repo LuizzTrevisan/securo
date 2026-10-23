@@ -5,9 +5,9 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.app_clock import app_today
 from app.core.database import get_async_session
 from app.core.workspace_context import WorkspaceContext, current_workspace
-from app.core.app_clock import app_today
 from app.schemas.report import CategoryStatementResponse, ReportResponse
 from app.services import category_statement_service, report_service
 
@@ -68,7 +68,12 @@ def _resolve_custom_range(
             status_code=422,
             detail="end_date must be on or after start_date",
         )
-    if end_date > date.today():
+    # The app's calendar, not the host clock: the workspace's request runs
+    # on its own timezone (see the `current_workspace` dependency), and the
+    # service below builds the same window from `app_today()`. Comparing
+    # against a different calendar would reject the workspace's own today
+    # or accept a date the workspace has not reached yet.
+    if end_date > app_today():
         raise HTTPException(
             status_code=422,
             detail="end_date must be on or before today",

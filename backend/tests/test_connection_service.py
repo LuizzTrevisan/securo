@@ -22,6 +22,7 @@ from app.providers.base import (
     ConnectionData,
     ConnectTokenData,
     HoldingData,
+    ProviderRateLimited,
     ProviderUserActionRequired,
     TransactionData,
 )
@@ -851,15 +852,47 @@ async def test_sync_connection_new_transactions(session: AsyncSession, test_user
          patch("app.services.connection_service.detect_transfer_pairs", new_callable=AsyncMock), \
          patch("app.services.connection_service.stamp_primary_amount", new_callable=AsyncMock), \
          patch("app.services.connection_service.apply_rules_to_transaction", new_callable=AsyncMock):
-        result_conn, merged = await sync_connection(session, conn.id, test_workspace.id, test_user.id)
+        result_conn, merged, outcome = await sync_connection(session, conn.id, test_workspace.id, test_user.id)
 
     assert result_conn.status == "active"
     assert merged == 0
+    assert outcome == "refreshed"
     transaction = await session.scalar(
         select(Transaction).where(Transaction.external_id == "sync-tx-1")
     )
     assert transaction is not None
     assert transaction.original_description == "GROCERY"
+
+
+@pytest.mark.asyncio
+async def test_sync_connection_rate_limited_reports_outcome_and_keeps_last_sync(
+    session: AsyncSession, test_user, test_workspace,
+):
+    """A provider 429 must not look like a successful sync (issue #736).
+
+    The connection stays active, nothing is merged, last_sync_at is left
+    untouched so the next sync retries the same window, and the caller gets
+    an explicit "rate_limited" outcome to show instead of a success toast.
+    """
+    conn = await _make_connection(session, test_user.id, "Limited Bank")
+    stale_sync_at = conn.last_sync_at
+    assert stale_sync_at is not None
+
+    mock_provider = AsyncMock()
+    mock_provider.refresh_credentials = AsyncMock(return_value={"token": "fake"})
+    mock_provider.get_accounts = AsyncMock(
+        side_effect=ProviderRateLimited("Daily request limit reached")
+    )
+
+    with patch("app.services.connection_service.get_provider", return_value=mock_provider):
+        result_conn, merged, outcome = await sync_connection(
+            session, conn.id, test_workspace.id, test_user.id
+        )
+
+    assert outcome == "rate_limited"
+    assert merged == 0
+    assert result_conn.status == "active"
+    assert result_conn.last_sync_at == stale_sync_at
 
 
 @pytest.mark.asyncio
@@ -889,7 +922,7 @@ async def test_sync_connection_partial_user_action_warning_marks_connection_erro
          patch("app.services.connection_service.detect_transfer_pairs", new_callable=AsyncMock), \
          patch("app.services.connection_service.stamp_primary_amount", new_callable=AsyncMock), \
          patch("app.services.connection_service.apply_rules_to_transaction", new_callable=AsyncMock):
-        result_conn, merged = await sync_connection(session, conn.id, test_workspace.id, test_user.id)
+        result_conn, merged, _ = await sync_connection(session, conn.id, test_workspace.id, test_user.id)
 
     assert result_conn.status == "error"
     assert merged == 0
@@ -967,7 +1000,7 @@ async def test_sync_connection_simplefin_rekey_does_not_duplicate_account_or_tx(
          patch("app.services.connection_service.detect_transfer_pairs", new_callable=AsyncMock), \
          patch("app.services.connection_service.stamp_primary_amount", new_callable=AsyncMock), \
          patch("app.services.connection_service.apply_rules_to_transaction", new_callable=AsyncMock):
-        result_conn, merged = await sync_connection(session, conn.id, test_workspace.id, test_user.id)
+        result_conn, merged, _ = await sync_connection(session, conn.id, test_workspace.id, test_user.id)
 
     assert result_conn.status == "active"
     assert merged == 0
@@ -1148,7 +1181,7 @@ async def test_find_existing_connected_account_masked_fallback_skips_rows_with_a
     When a persisted account's details request is skipped (partial provider
     failure) and a *different* account surfaces with the same masked number and
     currency, the fallback would rebind the skipped row and overwrite its stable
-    id — mixing two account histories. Rows that already carry a stable id are
+    id, mixing two account histories. Rows that already carry a stable id are
     identified, so they must be out of scope for the fallback.
     """
     conn = await _make_connection(session, test_user.id, "MaskedBank")
@@ -2027,7 +2060,7 @@ async def test_sync_connection_tolerates_duplicate_transaction_rows(
          patch("app.services.connection_service.stamp_primary_amount", new_callable=AsyncMock), \
          patch("app.services.connection_service._cleanup_phantom_duplicates", new_callable=AsyncMock), \
          patch("app.services.connection_service.apply_rules_to_transaction", new_callable=AsyncMock):
-        result_conn, _ = await sync_connection(session, conn.id, test_workspace.id, test_user.id)
+        result_conn, _, _ = await sync_connection(session, conn.id, test_workspace.id, test_user.id)
 
     assert result_conn.status == "active"
     # Sync reconciled onto an existing row instead of inserting a third, and did
@@ -2096,7 +2129,7 @@ async def test_sync_connection_with_category_mapping(session: AsyncSession, test
     with patch("app.services.connection_service.get_provider", return_value=mock_provider), \
          patch("app.services.connection_service.detect_transfer_pairs", new_callable=AsyncMock), \
          patch("app.services.connection_service.stamp_primary_amount", new_callable=AsyncMock):
-        result_conn, _ = await sync_connection(session, conn.id, test_workspace.id, test_user.id)
+        result_conn, _, _ = await sync_connection(session, conn.id, test_workspace.id, test_user.id)
 
     assert result_conn.status == "active"
 
@@ -2552,7 +2585,7 @@ async def test_sync_connection_skips_pending(session: AsyncSession, test_user, t
          patch("app.services.connection_service.detect_transfer_pairs", new_callable=AsyncMock), \
          patch("app.services.connection_service.stamp_primary_amount", new_callable=AsyncMock), \
          patch("app.services.connection_service.apply_rules_to_transaction", new_callable=AsyncMock):
-        result_conn, _ = await sync_connection(session, conn.id, test_workspace.id, test_user.id)
+        result_conn, _, _ = await sync_connection(session, conn.id, test_workspace.id, test_user.id)
 
     assert result_conn.status == "active"
 
@@ -2587,7 +2620,7 @@ async def test_sync_connection_skips_holdings_when_asset_sync_disabled(
          patch("app.services.connection_service.detect_transfer_pairs", new_callable=AsyncMock), \
          patch("app.services.connection_service.stamp_primary_amount", new_callable=AsyncMock), \
          patch("app.services.connection_service.apply_rules_to_transaction", new_callable=AsyncMock):
-        result_conn, _ = await sync_connection(session, conn.id, test_workspace.id, test_user.id)
+        result_conn, _, _ = await sync_connection(session, conn.id, test_workspace.id, test_user.id)
 
     assert result_conn.status == "active"
     mock_provider.get_holdings.assert_not_awaited()
@@ -2622,7 +2655,7 @@ async def test_sync_connection_imports_holdings_by_default(
          patch("app.services.connection_service.detect_transfer_pairs", new_callable=AsyncMock), \
          patch("app.services.connection_service.stamp_primary_amount", new_callable=AsyncMock), \
          patch("app.services.connection_service.apply_rules_to_transaction", new_callable=AsyncMock):
-        result_conn, _ = await sync_connection(session, conn.id, test_workspace.id, test_user.id)
+        result_conn, _, _ = await sync_connection(session, conn.id, test_workspace.id, test_user.id)
 
     assert result_conn.status == "active"
     mock_provider.get_holdings.assert_awaited_once()
@@ -3095,7 +3128,7 @@ async def test_sync_swallows_get_bills_error(
     p1, p2, p3 = _patch_sync_helpers()
     with patch("app.services.connection_service.get_provider", return_value=mock_provider), \
          p1, p2, p3:
-        result, _ = await sync_connection(session, conn.id, test_workspace.id, test_user.id)
+        result, _, _ = await sync_connection(session, conn.id, test_workspace.id, test_user.id)
 
     assert result.status == "active"
     tx_row = (await session.execute(

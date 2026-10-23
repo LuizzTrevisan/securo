@@ -11,6 +11,8 @@ class AccountBase(BaseModel):
     type: str
     balance: Decimal
     currency: str = "USD"
+    # Loan accounts only: the property or vehicle the loan is secured against.
+    secured_asset_id: Optional[uuid.UUID] = None
 
 
 class AccountCreate(BaseModel):
@@ -19,6 +21,7 @@ class AccountCreate(BaseModel):
     balance: Decimal = Decimal("0.00")
     balance_date: Optional[date] = None
     currency: str = "USD"
+    secured_asset_id: Optional[uuid.UUID] = None
     credit_limit: Optional[Decimal] = None
     statement_close_day: Optional[int] = None
     payment_due_day: Optional[int] = None
@@ -31,6 +34,7 @@ class AccountUpdate(BaseModel):
     name: Optional[str] = None
     display_name: Optional[str] = None
     type: Optional[str] = None
+    secured_asset_id: Optional[uuid.UUID] = None
     balance: Optional[Decimal] = None
     balance_date: Optional[date] = None
     credit_limit: Optional[Decimal] = None
@@ -57,6 +61,8 @@ class AccountRead(AccountBase):
     institution_logo_url: Optional[str] = None
     current_balance: float = 0.0
     previous_balance: Optional[float] = None
+    # Date of the opening-balance transaction; null when there is none.
+    balance_date: Optional[date] = None
     balance_primary: Optional[float] = None
     # True when the account is in a foreign currency and no real FX rate is
     # available, so balance_primary is left unset rather than a 1:1 guess.
@@ -112,3 +118,11 @@ class AccountSummary(BaseModel):
     # True when no real FX rate is available, so the *_primary fields are
     # left unset rather than a 1:1 guess.
     fx_fallback: bool = False
+
+
+class AccountRunningBalancePoint(BaseModel):
+    """End-of-day balance on the account page's walk (#1202)."""
+
+    date: date
+    balance: float
+    balance_primary: Optional[float] = None

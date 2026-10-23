@@ -3,11 +3,11 @@ import { getAccountName } from '@/lib/account-utils'
 import { useParams, Link } from 'react-router-dom'
 import { useTranslation } from 'react-i18next'
 import { useDisplayLocale, useDateLocale } from '@/hooks/use-display-locale'
-import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useQuery, useQueries, useInfiniteQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { format, addDays, addMonths, parseISO } from 'date-fns'
 import { accounts, dashboard, transactions, categories as categoriesApi, categoryGroups as categoryGroupsApi } from '@/lib/api'
 import { localDateString } from '@/lib/date-utils'
-import { applyTransactionToBalance, excludeMaterializedProjections, transactionAmountForBalance } from '@/lib/account-detail-utils'
+import { applyTransactionToBalance, excludeMaterializedProjections, mergeRunningBalances, runningBalanceChartFrom, transactionAmountForBalance } from '@/lib/account-detail-utils'
 import { invalidateFinancialQueries } from '@/lib/invalidate-queries'
 import { shouldShowPendingBadge } from '@/lib/transaction-status'
 import { closeDateForBill, isOpenCycleWindow } from '@/lib/credit-card-cycle'
@@ -44,6 +44,12 @@ import {
   Tooltip,
   ResponsiveContainer,
 } from 'recharts'
+
+// Rows per "Show more" on a non-credit-card account. Balances come from the
+// server, so they hold whatever has been loaded (#1202).
+const TRANSACTIONS_PAGE_SIZE = 100
+// The API's cap on one page; a credit-card cycle is fetched in full.
+const CYCLE_PAGE_SIZE = 500
 
 function defaultFrom() {
   const now = new Date()
@@ -510,25 +516,77 @@ export default function AccountDetailPage() {
     })),
   })
 
-  const { data: txData, isLoading: txLoading } = useQuery({
-    queryKey: ['transactions', { account_id: id, bill_id: activeBill?.id, from: filterFrom, to: filterTo, limit: 500, include_opening_balance: true, unbilled_only: isInProgressCycle }],
-    queryFn: () => transactions.list({
+  // A credit-card cycle is bounded by its bill, so the card keeps the
+  // client-side cycle math below, which needs every row of the cycle rather
+  // than the first page (#1202).
+  const { data: cycleTxData, isLoading: cycleTxLoading } = useQuery({
+    queryKey: ['transactions', { account_id: id, bill_id: activeBill?.id, from: filterFrom, to: filterTo, include_opening_balance: true, unbilled_only: isInProgressCycle }],
+    queryFn: async () => {
+      const params = {
+        account_id: id,
+        // When the active cycle is a real bill, prefer bill_id (Pluggy's
+        // truth: picks up charges the bank rolled outside the nominal date
+        // range) AND keep from/to so manual / non-bill-linked txs (recurring
+        // fills, CSV imports) bucketed into this cycle still show up.
+        bill_id: activeBill?.id,
+        // For the in-progress cycle (CC has bills, but no bill matches the
+        // current view), exclude already-billed txs so the bar/list only
+        // shows what's accumulating toward the next bill.
+        unbilled_only: isInProgressCycle || undefined,
+        from: filterFrom || undefined,
+        to: filterTo || undefined,
+        limit: CYCLE_PAGE_SIZE,
+        include_opening_balance: true,
+      }
+      const first = await transactions.list({ ...params, page: 1 })
+      const items = [...first.items]
+      // An empty page ends the loop even if `total` moved under us.
+      for (let page = 2; items.length < first.total; page++) {
+        const next = await transactions.list({ ...params, page })
+        if (next.items.length === 0) break
+        items.push(...next.items)
+      }
+      return { ...first, items }
+    },
+    enabled: !!id && account?.type === 'credit_card',
+  })
+
+  // Any other account pages through the period newest first. Each row
+  // carries the balance right after it, which the server walks over the
+  // whole range, so a page's balances don't depend on the pages before or
+  // after it being loaded (#1202).
+  const ledger = useInfiniteQuery({
+    queryKey: ['transactions', { account_id: id, from: filterFrom, to: filterTo, limit: TRANSACTIONS_PAGE_SIZE, include_opening_balance: true, include_running_balance: true }],
+    queryFn: ({ pageParam }) => transactions.list({
       account_id: id,
-      // When the active cycle is a real bill, prefer bill_id (Pluggy's
-      // truth — picks up charges the bank rolled outside the nominal date
-      // range) AND keep from/to so manual / non-bill-linked txs (recurring
-      // fills, CSV imports) bucketed into this cycle still show up.
-      bill_id: activeBill?.id,
-      // For the in-progress cycle (CC has bills, but no bill matches the
-      // current view), exclude already-billed txs so the bar/list only
-      // shows what's accumulating toward the next bill.
-      unbilled_only: isInProgressCycle || undefined,
       from: filterFrom || undefined,
       to: filterTo || undefined,
-      limit: 500,
+      page: pageParam,
+      limit: TRANSACTIONS_PAGE_SIZE,
       include_opening_balance: true,
+      include_running_balance: true,
     }),
-    enabled: !!id,
+    initialPageParam: 1,
+    getNextPageParam: (lastPage, pages) => {
+      const loaded = pages.reduce((count, page) => count + page.items.length, 0)
+      return loaded < lastPage.total && lastPage.items.length > 0 ? pages.length + 1 : undefined
+    },
+    enabled: !!id && !!account && account.type !== 'credit_card',
+  })
+  const ledgerItems = useMemo(
+    () => ledger.data?.pages.flatMap((page) => page.items),
+    [ledger.data],
+  )
+  const ledgerTotal = ledger.data?.pages.at(-1)?.total ?? 0
+
+  // The chart spans the whole period whichever pages the list has loaded,
+  // so its balances come from the server as well (#1202). A range longer than
+  // the endpoint allows charts its latest part; the list still covers it all.
+  const chartFrom = runningBalanceChartFrom(filterFrom, filterTo)
+  const { data: runningBalanceSeries, isLoading: runningBalanceLoading } = useQuery({
+    queryKey: ['accounts', id, 'running-balance', chartFrom, filterTo],
+    queryFn: () => accounts.runningBalance(id!, chartFrom || undefined, filterTo || undefined),
+    enabled: !!id && !!account && account.type !== 'credit_card',
   })
 
   // Non-materialized recurring projections are forecast rows. They are kept
@@ -640,17 +698,21 @@ export default function AccountDetailPage() {
   const primaryShown = showPrimary && !fxFallback
   const usePrimary = !isForeignCurrency || primaryShown
   const displayCurrency = (isForeignCurrency && !primaryShown) ? (account?.currency || userCurrency) : userCurrency
+  const txLoading = isCreditCard ? cycleTxLoading : ledger.isLoading
+  const chartLoading = isCreditCard ? cycleTxLoading : runningBalanceLoading
 
   // Pseudo-transaction rows for non-materialized recurring projections.
   // Virtual: rendered with a "Previsão" badge, non-clickable, and merged
-  // into displayRows where running balances are computed for them.
-  const projectedRows = useMemo((): TxWithBalance[] => {
+  // into displayRows where running balances are computed for them. The
+  // projections endpoint already drops materialized occurrences; checking
+  // the loaded rows as well covers a list fresher than the projections.
+  const projectedRows = useMemo((): Transaction[] => {
     if (!projectedTxData) return []
     const unmaterialized = excludeMaterializedProjections(
       projectedTxData,
-      txData?.items ?? [],
+      ledgerItems ?? [],
     )
-    return unmaterialized.map((p: ProjectedTransaction): TxWithBalance => ({
+    return unmaterialized.map((p: ProjectedTransaction): Transaction => ({
       id: `projected-${p.recurring_id}-${p.date}`,
       user_id: '',
       account_id: id ?? null,
@@ -697,27 +759,26 @@ export default function AccountDetailPage() {
       splits: [],
       is_ignored: false,
       virtual: true,
-      runningBalance: 0,
     }))
-  }, [projectedTxData, txData?.items, id])
+  }, [projectedTxData, ledgerItems, id])
 
-  // Balance at the start of the period, used to seed the running-balance
-  // walk so that the last row's balance matches the projected balance at
-  // date_to. For CC accounts this is not used (cycle total starts from 0).
+  // Balance at the start of the period, which projections dated before the
+  // first real row of the range start from. For CC accounts this is not used
+  // (cycle total starts from 0).
   const openingBalance = usePrimary
     ? (summary?.opening_balance_primary ?? summary?.opening_balance ?? 0)
     : (summary?.opening_balance ?? 0)
 
   // Chart data:
-  // - Non-CC: daily running balance seeded from the current posted balance.
-  //   Pending and recurring rows are added only to this forecast walk.
+  // - Non-CC: the server's end-of-day balance (pending rows included), with
+  //   recurring projections added on top as a running forecast.
   // - CC: cumulative charges within the current cycle, starting at 0
   //   (answers "how much have I spent this cycle", ignores bill payments/transfers)
   const chartData = useMemo(() => {
     if (isCreditCard) {
-      if (!txData?.items) return []
+      if (!cycleTxData?.items) return []
       const byDay = new Map<string, number>()
-      for (const tx of txData.items) {
+      for (const tx of cycleTxData.items) {
         if (tx.type !== 'debit') continue
         if (tx.source === 'opening_balance') continue
         if (tx.transfer_pair_id) continue
@@ -759,29 +820,23 @@ export default function AccountDetailPage() {
       }
       return series
     }
-    if (!txData?.items || !summary || !filterFrom || !filterTo) return []
-    const allTx = [...txData.items, ...projectedRows]
-    const txByDay = new Map<string, number>()
-    for (const tx of allTx) {
-      const previous = txByDay.get(tx.date) ?? 0
-      txByDay.set(tx.date, applyTransactionToBalance(previous, tx, usePrimary, displayCurrency))
+    if (!runningBalanceSeries) return []
+    const projectedByDay = new Map<string, number>()
+    for (const tx of projectedRows) {
+      const previous = projectedByDay.get(tx.date) ?? 0
+      projectedByDay.set(tx.date, applyTransactionToBalance(previous, tx, usePrimary, displayCurrency))
     }
-    const series: { label: string; date: string; balance: number }[] = []
-    let balance = openingBalance
-    const cur = new Date(filterFrom + 'T00:00:00')
-    const end = new Date(filterTo + 'T00:00:00')
-    while (cur <= end) {
-      const key = cur.toLocaleDateString('sv-SE')
-      balance += txByDay.get(key) ?? 0
-      series.push({ label: formatDateStr(key, dateLocale), date: key, balance })
-      cur.setDate(cur.getDate() + 1)
-    }
-    return series
-  }, [isCreditCard, txData, projectedRows, filterFrom, filterTo, dateLocale, usePrimary, displayCurrency, summary, openingBalance, activeBill])
+    let projected = 0
+    return runningBalanceSeries.map((point) => {
+      projected += projectedByDay.get(point.date) ?? 0
+      const balance = usePrimary ? (point.balance_primary ?? point.balance) : point.balance
+      return { label: formatDateStr(point.date, dateLocale), date: point.date, balance: balance + projected }
+    })
+  }, [isCreditCard, cycleTxData, runningBalanceSeries, projectedRows, filterFrom, filterTo, dateLocale, usePrimary, displayCurrency, activeBill])
 
   const ccRunningTotal = useMemo((): TxWithBalance[] => {
-    if (!isCreditCard || !txData?.items) return []
-    const ascending = [...txData.items].sort(
+    if (!isCreditCard || !cycleTxData?.items) return []
+    const ascending = [...cycleTxData.items].sort(
       (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime(),
     )
     let running = 0
@@ -795,29 +850,21 @@ export default function AccountDetailPage() {
       return { ...tx, runningBalance: running }
     })
     return withBalance.reverse()
-  }, [txData, isCreditCard, usePrimary, displayCurrency])
+  }, [cycleTxData, isCreditCard, usePrimary, displayCurrency])
 
   // Merged list: real transactions, pending rows, and virtual recurring
-  // projections. The newest row is the forecast at the end of the range.
+  // projections. The newest row is the forecast at the end of the range,
+  // even before the older pages are loaded (#1202).
   const displayRows = useMemo((): TxWithBalance[] => {
     if (isCreditCard) return ccRunningTotal
-    if (!txData?.items || summary === undefined) return []
-
-    // Secondary sort by the original index in txData.items preserves the
-    // API's insertion order for same-day transactions (creation sequence).
-    const txIndex = new Map(txData.items.map((t, i) => [t.id, i]))
-    const merged = [...txData.items, ...projectedRows].sort(
-      (a, b) => new Date(a.date).getTime() - new Date(b.date).getTime()
-        || (txIndex.get(a.id) ?? Infinity) - (txIndex.get(b.id) ?? Infinity),
-    )
-
-    let balance = openingBalance
-    const withBalance = merged.map((tx) => ({
-      ...tx,
-      runningBalance: balance = applyTransactionToBalance(balance, tx, usePrimary, displayCurrency),
-    }))
-    return withBalance.reverse()
-  }, [txData, projectedRows, isCreditCard, summary, usePrimary, displayCurrency, openingBalance, ccRunningTotal])
+    if (!ledgerItems || summary === undefined) return []
+    return mergeRunningBalances(ledgerItems, projectedRows, {
+      openingBalance,
+      hasMore: ledger.hasNextPage,
+      usePrimary,
+      displayCurrency,
+    })
+  }, [ledgerItems, ledger.hasNextPage, projectedRows, isCreditCard, summary, usePrimary, displayCurrency, openingBalance, ccRunningTotal])
 
   const totalBalance = (usePrimary ? summary?.current_balance_primary : undefined) ?? summary?.current_balance ?? 0
   const projectedBalance = displayRows.length > 0 ? displayRows[0].runningBalance : openingBalance
@@ -1439,7 +1486,7 @@ export default function AccountDetailPage() {
           </p>
         </div>
         <div className="px-1 pb-4 h-[280px]">
-          {txLoading ? (
+          {chartLoading ? (
             <Skeleton className="h-full w-full" />
           ) : cycleEmpty ? (
             <div className="h-full w-full flex flex-col items-center justify-center gap-2 text-muted-foreground">
@@ -1721,6 +1768,20 @@ export default function AccountDetailPage() {
                 </tbody>
               </table>
             </div>
+          )}
+          {!isCreditCard && ledger.hasNextPage && (
+            <button
+              type="button"
+              className="w-full px-4 py-2.5 text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted transition-colors border-t border-border disabled:cursor-not-allowed disabled:opacity-50"
+              disabled={ledger.isFetchingNextPage}
+              onClick={() => ledger.fetchNextPage()}
+            >
+              {ledger.isFetchingNextPage
+                ? t('common.loading')
+                : t('common.showMore', {
+                    count: Math.min(TRANSACTIONS_PAGE_SIZE, ledgerTotal - (ledgerItems?.length ?? 0)),
+                  })}
+            </button>
           )}
         </div>
       </div>

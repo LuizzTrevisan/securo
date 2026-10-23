@@ -7,8 +7,8 @@ Create Date: 2026-10-02
 Enable Banking identifies an account by a `uid` that is scoped to a single
 session, so reauthorising (which mints a new session) hands back a new uid for
 the same real account. The sync matched accounts only on `external_id`, so it
-inserted a second row and left the original — with its transactions, rules and
-name overrides — behind.
+inserted a second row and left the original (with its transactions, rules and
+name overrides) behind.
 
 EB publishes an `identification_hash` precisely to match the same account across
 sessions. Persist it here so the sync can rebind the existing row to the new uid

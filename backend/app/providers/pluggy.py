@@ -289,6 +289,7 @@ def _build_holding_data(inv: dict) -> HoldingData:
     who care about the distinction.
     """
     current_value = _decimal_or_none(inv.get("balance")) or Decimal("0")
+    quantity = _decimal_or_none(inv.get("quantity"))
     pluggy_status = (inv.get("status") or "").upper()
     pluggy_type = (inv.get("type") or "").upper()
 
@@ -298,18 +299,27 @@ def _build_holding_data(inv: dict) -> HoldingData:
 
     metadata = {k: v for k, v in inv.items() if k not in _HOLDING_PROMOTED_KEYS}
 
+    # A fully withdrawn position reports zero (or absent) balance and
+    # quantity. When the status is TOTAL_WITHDRAWAL but the same payload
+    # still carries a nonzero balance or quantity, the status is stale or
+    # transient and the position is still open, so it must not be marked
+    # as sold (issue #819). Negative figures count as open too: hiding them
+    # would drop a real balance from the user's view.
+    position_has_value = current_value != 0 or (quantity is not None and quantity != 0)
+    is_withdrawn = pluggy_status == "TOTAL_WITHDRAWAL" and not position_has_value
+
     return HoldingData(
         external_id=str(inv["id"]),
         name=inv.get("name") or "Investment",
         currency=inv.get("currencyCode") or "BRL",
         current_value=current_value,
-        quantity=_decimal_or_none(inv.get("quantity")),
+        quantity=quantity,
         unit_price=_decimal_or_none(inv.get("value")),
         purchase_price=_decimal_or_none(inv.get("amountOriginal")),
         purchase_date=purchase_date,
         isin=inv.get("isin") or None,
         maturity_date=_date_or_none(inv.get("dueDate")),
-        is_withdrawn=pluggy_status == "TOTAL_WITHDRAWAL",
+        is_withdrawn=is_withdrawn,
         metadata=metadata or None,
     )
 

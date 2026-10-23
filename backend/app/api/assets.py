@@ -14,6 +14,7 @@ from app.core.workspace_context import (
     current_workspace,
     current_writable_workspace,
 )
+from app.models.asset import ASSET_PRICE_DECIMALS
 from app.models.user import User
 from app.providers.market_price import (
     MarketPriceRateLimitedError,
@@ -161,11 +162,13 @@ async def refresh_asset_price(
     if refreshed.currency != primary_currency and refreshed.current_value is not None:
         converted, _ = await convert(
             session, Decimal(str(refreshed.current_value)), refreshed.currency, primary_currency,
+            decimals=ASSET_PRICE_DECIMALS,
         )
         refreshed.current_value_primary = float(converted)
         if refreshed.gain_loss is not None:
             gl_converted, _ = await convert(
                 session, Decimal(str(refreshed.gain_loss)), refreshed.currency, primary_currency,
+                decimals=ASSET_PRICE_DECIMALS,
             )
             refreshed.gain_loss_primary = float(gl_converted)
     return refreshed
@@ -183,11 +186,13 @@ async def list_assets(
         if asset.currency != primary_currency and asset.current_value is not None:
             converted, _ = await convert(
                 session, Decimal(str(asset.current_value)), asset.currency, primary_currency,
+                decimals=ASSET_PRICE_DECIMALS,
             )
             asset.current_value_primary = float(converted)
             if asset.gain_loss is not None:
                 gl_converted, _ = await convert(
                     session, Decimal(str(asset.gain_loss)), asset.currency, primary_currency,
+                    decimals=ASSET_PRICE_DECIMALS,
                 )
                 asset.gain_loss_primary = float(gl_converted)
     return assets

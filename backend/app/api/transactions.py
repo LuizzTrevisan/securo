@@ -127,6 +127,7 @@ async def list_transactions(
     page: int = Query(1, ge=1),
     limit: int = Query(50, ge=1, le=500),
     include_opening_balance: bool = Query(False),
+    include_running_balance: bool = Query(False, description="Fill running_balance per row (issue #1202): one non-credit-card account, `from` set, include_opening_balance, no other filter, default order; null otherwise"),
     exclude_transfers: bool = Query(False),
     user_pnl_only: bool = Query(False, description="Return only rows that count toward dashboard/user income/expense totals"),
     exclude_ignored: bool = Query(False, description="Drop rows the user marked ignored, or whose category is ignored"),
@@ -160,6 +161,8 @@ async def list_transactions(
         min_amount=min_amount,
         max_amount=max_amount,
         include_summary=True,
+        include_running_balance=include_running_balance,
+        primary_currency=ctx.user.primary_currency,
     )
     primary_currency = ctx.user.primary_currency
     items = [_tag_fx_fallback(TransactionRead.model_validate(tx, from_attributes=True), primary_currency) for tx in transactions]
@@ -533,6 +536,26 @@ async def toggle_ignore_transaction(
     session: AsyncSession = Depends(get_async_session),
 ):
     transaction = await transaction_service.toggle_ignore_transaction(
+        session, transaction_id, ctx.workspace.id
+    )
+    if not transaction:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Transaction not found")
+    primary_currency = ctx.user.primary_currency
+    return _tag_fx_fallback(TransactionRead.model_validate(transaction, from_attributes=True), primary_currency)
+
+
+@router.post("/{transaction_id}/post-today", response_model=TransactionRead)
+async def post_transaction_today(
+    transaction_id: uuid.UUID,
+    ctx: WorkspaceContext = Depends(current_writable_workspace),
+    session: AsyncSession = Depends(get_async_session),
+):
+    """One-click "it cleared today" for a pending transaction.
+
+    Marks the transaction as posted and stamps today's calendar date, resolved
+    in the workspace's timezone, the same as saving the edit dialog by hand.
+    """
+    transaction = await transaction_service.post_transaction_today(
         session, transaction_id, ctx.workspace.id
     )
     if not transaction:
