@@ -8,11 +8,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.account import Account
 from app.models.category import Category
 from app.models.category_group import CategoryGroup
+from app.models.fx_rate import FxRate
 from app.models.group import Group, GroupMember
 from app.models.transaction_split import TransactionSplit
 from app.models.user import User
 from app.models.workspace import WorkspaceMember
 from app.models.transaction import Transaction
+from app.core.app_clock import app_today
 from app.services.category_statement_service import (
     _shift_month,
     get_category_statement,
@@ -406,3 +408,113 @@ async def test_uncategorized_drill_down_lists_shares_from_other_workspaces(
     # leaving it out: the user can't recategorize someone else's row.
     resp = await client.get("/api/transactions", headers=auth_headers, params=params)
     assert resp.json()["items"] == []
+
+
+async def _panel_total(client, auth_headers, user_id, category_id) -> float:
+    """Sum a category's drill-down the way the panel does with ownShare on:
+    a member keeps their share, the owner the amount less the other shares,
+    and the primary amount scales by the same ratio."""
+    resp = await client.get(
+        "/api/transactions", headers=auth_headers,
+        params={
+            "category_id": str(category_id), "type": "debit", "status": "posted",
+            "user_pnl_only": "true", "from": "2025-02-01", "to": "2025-02-28",
+        },
+    )
+    assert resp.status_code == 200
+    total = 0.0
+    for tx in resp.json()["items"]:
+        amount = float(tx["amount"])
+        primary = float(tx["amount_primary"] if tx["amount_primary"] is not None else amount)
+        splits = tx.get("splits") or []
+        viewer_share = float(tx["viewer_share"] or 0)
+        if tx["is_shared"]:
+            share = viewer_share
+        elif splits and tx["user_id"] == str(user_id):
+            share = amount - (sum(float(s["share_amount"]) for s in splits) - viewer_share)
+        else:
+            share = amount
+        total -= primary * share / amount
+    return round(total, 2)
+
+
+@pytest.mark.asyncio
+async def test_owner_split_in_foreign_currency_uses_the_stored_rate(
+    session: AsyncSession, client, auth_headers, test_user, test_workspace, test_categories
+):
+    """A USD 100 expense imported at 5 BRL/USD, split 50/50 with a friend,
+    reads -250 even when today's rate is 6, and the panel agrees."""
+    food = test_categories[0]
+    session.add(FxRate(
+        id=uuid.uuid4(), base_currency="USD", quote_currency="BRL",
+        rate=Decimal("6"), date=app_today(), source="test",
+    ))
+    group = Group(id=uuid.uuid4(), user_id=test_user.id, workspace_id=test_workspace.id, name="Trip")
+    session.add(group)
+    await session.flush()
+    me = GroupMember(id=uuid.uuid4(), group_id=group.id, workspace_id=test_workspace.id, name="Me", is_self=True)
+    friend = GroupMember(id=uuid.uuid4(), group_id=group.id, workspace_id=test_workspace.id, name="Friend")
+    session.add_all([me, friend])
+    account = await _account(session, test_user.id)
+    tx = _txn(
+        test_user.id, account, "100", date(2025, 2, 10), "debit", food.id,
+        currency="USD", amount_primary=Decimal("500"),
+    )
+    session.add(tx)
+    await session.flush()
+    session.add_all([
+        TransactionSplit(id=uuid.uuid4(), transaction_id=tx.id, workspace_id=test_workspace.id,
+                         group_member_id=me.id, share_amount=Decimal("50")),
+        TransactionSplit(id=uuid.uuid4(), transaction_id=tx.id, workspace_id=test_workspace.id,
+                         group_member_id=friend.id, share_amount=Decimal("50")),
+    ])
+    await session.commit()
+
+    statement = await get_category_statement(
+        session, test_workspace.id, test_user.id, date(2025, 2, 1), months=1,
+        primary_currency="BRL",
+    )
+    [row] = statement.expenses.rows
+    assert row.values == [-250.0]
+    assert await _panel_total(client, auth_headers, test_user.id, food.id) == -250.0
+
+
+@pytest.mark.asyncio
+async def test_payer_in_someone_elses_group_counts_their_own_share(
+    session: AsyncSession, client, auth_headers, test_user, test_workspace, test_categories
+):
+    """The user pays 100 in a group another workspace member created, split
+    70 to the creator and 30 to the user. Cell and panel both read -30, not
+    the creator's 70."""
+    food = test_categories[0]
+    creator = await _workspace_member(session, test_workspace.id, "creator@example.com")
+    group = Group(id=uuid.uuid4(), user_id=creator.id, workspace_id=test_workspace.id, name="Flat")
+    session.add(group)
+    await session.flush()
+    creator_member = GroupMember(
+        id=uuid.uuid4(), group_id=group.id, workspace_id=test_workspace.id, name="Creator", is_self=True,
+    )
+    user_member = GroupMember(
+        id=uuid.uuid4(), group_id=group.id, workspace_id=test_workspace.id,
+        name="User", linked_user_id=test_user.id,
+    )
+    session.add_all([creator_member, user_member])
+    account = await _account(session, test_user.id)
+    tx = _txn(test_user.id, account, "100", date(2025, 2, 10), "debit", food.id)
+    session.add(tx)
+    await session.flush()
+    session.add_all([
+        TransactionSplit(id=uuid.uuid4(), transaction_id=tx.id, workspace_id=test_workspace.id,
+                         group_member_id=creator_member.id, share_amount=Decimal("70")),
+        TransactionSplit(id=uuid.uuid4(), transaction_id=tx.id, workspace_id=test_workspace.id,
+                         group_member_id=user_member.id, share_amount=Decimal("30")),
+    ])
+    await session.commit()
+
+    statement = await get_category_statement(
+        session, test_workspace.id, test_user.id, date(2025, 2, 1), months=1,
+        primary_currency="BRL",
+    )
+    [row] = statement.expenses.rows
+    assert row.values == [-30.0]
+    assert await _panel_total(client, auth_headers, test_user.id, food.id) == -30.0

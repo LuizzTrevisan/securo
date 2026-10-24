@@ -13,7 +13,7 @@ import uuid
 from datetime import date
 from typing import Optional
 
-from sqlalchemy import case, func, select
+from sqlalchemy import and_, case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.app_clock import app_today
@@ -28,7 +28,6 @@ from app.schemas.report import (
 )
 from app.services._query_filters import (
     counts_as_user_pnl,
-    owner_split_offset_by_category,
     reporting_date_col,
     viewer_shared_spending_by_category,
 )
@@ -47,6 +46,51 @@ def _shift_month(month_start: date, delta: int) -> date:
 
 def _sum_values(rows: list[CategoryStatementRow], width: int) -> list[float]:
     return [round(sum(row.values[i] for row in rows), 2) for i in range(width)]
+
+
+async def _owner_split_offset_by_category(
+    session: AsyncSession,
+    user_id: uuid.UUID,
+    amount_expr,
+    filters: list,
+) -> dict[Optional[uuid.UUID], float]:
+    """Per category, the other members' shares of the viewer's own split
+    expenses in this workspace, for the viewer to subtract.
+
+    Shares are scaled into the primary amount by the transaction's own
+    ratio, so they use the rate stored at import like the totals they come
+    off, not today's rate.
+    """
+    from app.models.group import Group, GroupMember
+    from app.models.transaction_split import TransactionSplit
+
+    viewer_member_ids = (
+        select(GroupMember.id)
+        .outerjoin(Group, Group.id == GroupMember.group_id)
+        .where(
+            or_(
+                GroupMember.linked_user_id == user_id,
+                and_(GroupMember.is_self.is_(True), Group.user_id == user_id),
+            )
+        )
+    )
+    share_primary = (
+        TransactionSplit.share_amount * amount_expr / func.nullif(func.abs(Transaction.amount), 0)
+    )
+    result = await session.execute(
+        select(Transaction.category_id, func.sum(share_primary))
+        .select_from(TransactionSplit)
+        .join(Transaction, TransactionSplit.transaction_id == Transaction.id)
+        .join(Account, Transaction.account_id == Account.id)
+        .where(
+            *filters,
+            Transaction.type == "debit",
+            Transaction.user_id == user_id,
+            TransactionSplit.group_member_id.notin_(viewer_member_ids),
+        )
+        .group_by(Transaction.category_id)
+    )
+    return {cat_id: float(total or 0) for cat_id, total in result.all()}
 
 
 async def _member_split_offset_by_category(
@@ -155,15 +199,13 @@ async def get_category_statement(
 
         if not filtered:
             use_effective_date = accounting_mode == "accrual"
-            own_offset = await owner_split_offset_by_category(
-                session, user_id, m_start, m_end,
-                use_effective_date=use_effective_date,
-                primary_currency=primary_currency,
-                workspace_id=workspace_id,
+            own_offset = await _owner_split_offset_by_category(
+                session, user_id, amount_expr,
+                [*base_filters, report_date >= m_start, report_date < m_end],
             )
             for cat_id, offset in own_offset.items():
                 credits, debits = totals.get(cat_id, (0.0, 0.0))
-                totals[cat_id] = (credits, max(0.0, debits - float(offset)))
+                totals[cat_id] = (credits, max(0.0, debits - offset))
             # Another member's split expense in this workspace is already in
             # the totals at its full amount; keep only the viewer's share.
             member_offset = await _member_split_offset_by_category(
@@ -208,11 +250,8 @@ async def get_category_statement(
     lifetime_net = {cat_id: float(net or 0) for cat_id, net in lifetime_result.all()}
     if not filtered:
         use_effective_date = accounting_mode == "accrual"
-        own_offset = await owner_split_offset_by_category(
-            session, user_id, date.min, lifetime_end,
-            use_effective_date=use_effective_date,
-            primary_currency=primary_currency,
-            workspace_id=workspace_id,
+        own_offset = await _owner_split_offset_by_category(
+            session, user_id, amount_expr, [*base_filters, report_date < lifetime_end],
         )
         member_offset = await _member_split_offset_by_category(
             session, user_id, amount_expr, [*base_filters, report_date < lifetime_end],

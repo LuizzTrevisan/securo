@@ -707,7 +707,12 @@ async def _tag_shared_view(
                 if owner_group_id is not None
                 else None
             )
-            owner_split = (
+            # In someone else's group the payer is a linked member, and the
+            # is_self member is the group's creator, not them.
+            owner_split = next(
+                (s for s in tx.splits or [] if s.group_member_id in member_to_group),
+                None,
+            ) or (
                 next(
                     (s for s in tx.splits or [] if s.group_member_id == self_mid),
                     None,
